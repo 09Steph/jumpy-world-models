@@ -1,0 +1,42 @@
+# Caches and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Run artefacts. Keep the directory, not the contents.
+outputs/*
+!outputs/.gitkeep
+
+# Throwaway diagnostic scripts
+temp_files/
+
+# Test suite. Untracked by decision, 2026-08-17.
+# NOTE: the reproducibility appendix and the submitted code repo are graded, and
+# `git add tests/...` on an ignored path succeeds silently while adding nothing.
+# Revisit before the 11-12 September code-vs-report audit.
+/tests
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local environments (managed via environment.yml)
+.venv/
+venv/
+env/

@@ -1,0 +1,27 @@
+[project]
+name = "jumpy-world-models"
+version = "0.1.0"
+description = "Direct variable-horizon state prediction with a transformer (ELEC0054 Project 75)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pylint.messages_control]
+# Enforced project conventions rather than defaults.
+disable = [
+    "logging-fstring-interpolation",  # we use %s lazy logging, not f-strings
+]
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint.basic]
+# Enforce snake_case for methods and functions; no camelCase.
+method-naming-style = "snake_case"
+function-naming-style = "snake_case"
+
+[tool.pytest.ini_options]
+# Ensures `from config import ...` and `from src... import ...` resolve
+# correctly when pytest is invoked from any directory, not just the repo
+# root -- there is no editable install ([build-system]) to rely on instead.
+pythonpath = ["."]
+testpaths = ["tests"]
