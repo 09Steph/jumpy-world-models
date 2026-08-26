@@ -1,1 +1,1 @@
-"""World model, networks, distributions, and the action-gap termination signal."""
+"""The jumpy transformer, the autoregressive baseline, and their components."""
