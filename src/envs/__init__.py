@@ -1,1 +1,1 @@
-"""Environment adapters: NAVIX (native), MiniHack (Gym), and shared wrappers."""
+"""Environment adapters: NAVIX (native) and shared wrappers."""
