@@ -1,10 +1,8 @@
 """Figure drawing for the evaluation artefacts.
 
-Kept apart from the computation, so the numbers can be recomputed without a
-plotting dependency.
-
-The x-axis is logarithmic. Markers, error bars and sample counts appear at a
-handful of horizons, not all hundred, with the full curve drawn as a line.
+Every x-axis is logarithmic in the horizon. The displacement figures mark and
+error-bar a subset of horizons and annotate sample counts at the extremes. The
+error-against-horizon figure marks every point and shades its interval instead.
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ from config import (  # noqa: E402  pylint: disable=wrong-import-position,ungrou
     DISPLACEMENT_CHANNELS_FIGURE_FILENAME,
     DISPLACEMENT_FIGURE_FILENAME,
     DISPLACEMENT_MARKER_HORIZONS,
+    ERROR_HORIZON_FIGURE_FILENAME,
     SATURATION_ABSOLUTE_PCT_THRESHOLD,
 )
 from src.utils.logging_setup import get_logger  # noqa: E402  pylint: disable=wrong-import-position,ungrouped-imports
@@ -34,8 +33,7 @@ FIGURE_DPI: int = 150
 FIGURE_SIZE: tuple[float, float] = (11.0, 4.5)
 CHANNEL_FIGURE_SIZE: tuple[float, float] = (7.0, 4.5)
 
-# Channel names in the NAVIX symbolic observation. Channel 2 is what makes
-# rotation visible: a turn changes it and leaves the object channel alone.
+# Channel names in the NAVIX symbolic observation.
 CHANNEL_LABELS: dict[str, str] = {
     "0": "channel 0: object", "1": "channel 1: colour", "2": "channel 2: direction",
 }
@@ -118,8 +116,7 @@ def _draw_hamming_panel(axis, rows: Sequence[dict]) -> None:
             mark_h, mark_v, yerr=mark_e, fmt="o", markersize=4, capsize=3,
             color=line.get_color(), linewidth=1.0,
         )
-        # Sample counts at the extremes only, so a thin tail reads as thin
-        # and not as saturation.
+        # Sample counts at the first and last horizon only.
         for index in (0, -1):
             axis.annotate(
                 f"n={counts[index]}",
@@ -165,10 +162,7 @@ def _draw_agent_panel(axis, rows: Sequence[dict]) -> None:
 def draw_displacement_figure(
     rows: Sequence[dict], target: Path, environment: str
 ) -> Path:
-    """Draw the gate figure: cell-level Hamming and agent Manhattan against h.
-
-    The two panels sit side by side. The comparison is the finding: agent
-    displacement rising while Hamming stays flat.
+    """Draw cell-level Hamming and agent Manhattan against h, side by side.
 
     Args:
         rows: The measured rows.
@@ -193,10 +187,7 @@ def draw_displacement_figure(
 def draw_channel_figure(
     rows: Sequence[dict], target: Path, environment: str
 ) -> Path:
-    """Draw per-channel Hamming displacement, which is the rotation diagnosis.
-
-    Channel 2 moving while channel 0 sits still is rotation, read directly and
-    not inferred from two aggregate curves.
+    """Draw per-channel Hamming displacement, one panel per observation mode.
 
     Args:
         rows: The measured rows.
@@ -237,4 +228,101 @@ def draw_channel_figure(
     figure.savefig(path, dpi=FIGURE_DPI)
     plt.close(figure)
     logger.info("wrote per-channel figure -> %s", safe_rel(path))
+    return path
+
+
+def _arm_horizon_series(
+    aggregate: dict, mode: str, measure: str
+) -> tuple[list[int], list[float], list[float], list[float]]:
+    """Pull one measure's IQM curve and interval out of a per-arm aggregate.
+
+    Args:
+        aggregate: A loaded `aggregate_arm*.json`.
+        mode: Observation mode key.
+        measure: Metric name inside `per_horizon`, for example
+            `model_cross_entropy`.
+
+    Returns:
+        Horizons, IQM values and the interval's lower and upper bounds, ordered
+        by horizon. A horizon whose measure is absent is skipped, so a partially
+        aggregated arm returns a short curve rather than raising.
+    """
+    per_horizon = aggregate["by_mode"][mode]["per_horizon"]
+    horizons: list[int] = []
+    centre: list[float] = []
+    lower: list[float] = []
+    upper: list[float] = []
+    for key in sorted(per_horizon, key=int):
+        block = per_horizon[key].get(measure)
+        if not isinstance(block, dict) or block.get("iqm") is None:
+            continue
+        horizons.append(int(key))
+        centre.append(float(block["iqm"]))
+        lower.append(float(block.get("ci_low", block["iqm"])))
+        upper.append(float(block.get("ci_high", block["iqm"])))
+    return horizons, centre, lower, upper
+
+
+def _draw_horizon_panel(axis, mode: str, arms: dict[str, dict]) -> None:
+    """Draw one observation mode's arms against horizon, over the copy floor.
+
+    The floor is read from the first arm that supplies it and drawn once, which
+    assumes every arm reports the same floor.
+    """
+    floor_drawn = False
+    for arm in sorted(arms):
+        aggregate = arms[arm]
+        if mode not in aggregate.get("by_mode", {}):
+            continue
+        horizons, centre, lower, upper = _arm_horizon_series(
+            aggregate, mode, "model_cross_entropy"
+        )
+        if not horizons:
+            continue
+        axis.plot(horizons, centre, marker="o", markersize=4, label=f"arm {arm}")
+        axis.fill_between(horizons, lower, upper, alpha=0.15)
+        if not floor_drawn:
+            floor_h, floor_c, _, _ = _arm_horizon_series(
+                aggregate, mode, "copy_cross_entropy"
+            )
+            if floor_h:
+                axis.plot(
+                    floor_h, floor_c, linestyle="--", color="grey",
+                    label="stationary-copy floor",
+                )
+                floor_drawn = True
+    axis.set_xscale("log")
+    axis.set_xlabel("horizon h")
+    axis.set_ylabel("held-out cross-entropy (IQM)")
+    axis.set_title(mode, fontsize=10)
+    axis.legend(fontsize=8)
+    axis.grid(alpha=0.3)
+
+
+def draw_error_against_horizon_figure(
+    arms_by_mode: dict[str, dict[str, dict]], target: Path, environment: str
+) -> Path:
+    """Draw error against horizon for every arm, one panel per observation mode.
+
+    Args:
+        arms_by_mode: Mode name to a mapping of arm label to loaded aggregate.
+        target: Directory to write into.
+        environment: Environment id, for the title.
+
+    Returns:
+        The path written.
+    """
+    modes = sorted(arms_by_mode)
+    figure, axes = plt.subplots(1, len(modes), figsize=FIGURE_SIZE, squeeze=False)
+    for index, mode in enumerate(modes):
+        _draw_horizon_panel(axes[0][index], mode, arms_by_mode[mode])
+    figure.suptitle(
+        f"Error against horizon, three arms over the copy floor -- {environment}",
+        fontsize=10,
+    )
+    figure.tight_layout()
+    path = target / ERROR_HORIZON_FIGURE_FILENAME
+    figure.savefig(path, dpi=FIGURE_DPI)
+    plt.close(figure)
+    logger.info("wrote error-against-horizon figure -> %s", safe_rel(path))
     return path
