@@ -1,10 +1,9 @@
 """The data contract between an environment and the model.
 
 A trajectory source produces `Trajectory` objects and describes itself with an
-`ObservationSpec`.
-
-Training reads `observations` and `actions` only. The remaining `Trajectory`
-fields are recorded; recovering them later means regenerating the dataset.
+`ObservationSpec`. Training reads `observations` and `actions` only. The
+remaining fields are still recorded, and recovering them later means
+regenerating the dataset.
 """
 
 from __future__ import annotations
@@ -49,8 +48,6 @@ class FieldSpec:
 class ObservationSpec:
     """Everything a tokeniser needs to know about an environment.
 
-    A list of fields, so a multi-field environment is representable.
-
     Attributes:
         fields: One FieldSpec per observation component, in a fixed order.
         num_actions: Size of the discrete action space, which sizes the action
@@ -81,7 +78,7 @@ class ObservationSpec:
 
 
 @dataclass(frozen=True)
-class Trajectory:
+class Trajectory:  # pylint: disable=too-many-instance-attributes
     """One complete episode, recorded in both observation modes.
 
     Attributes:
@@ -89,8 +86,7 @@ class Trajectory:
             (num_steps + 1, *field_shape, num_channels). The extra frame is the
             endpoint state reached after the final action.
         actions: Discrete action indices, shape (num_steps,).
-        rewards: Shape (num_steps,). Unread during training, recorded so a
-            later policy stage needs no regeneration.
+        rewards: Shape (num_steps,).
         terminated: Shape (num_steps,). True only at a genuine absorbing state.
         truncated: Shape (num_steps,). True at a step-limit cutoff, and never
             merged with `terminated`.
@@ -98,6 +94,9 @@ class Trajectory:
             pairs. The goal axis is kept, so an environment with several
             goals keeps the distinction.
         provenance: Seed, environment name and generating policy.
+        executed_actions: What the environment actually executed, shape
+            (num_steps,). Equal to `actions` unless slip was injected. Training
+            reads `actions`, the commanded one.
     """
 
     observations: dict[ObservationMode, jax.Array]
@@ -107,11 +106,8 @@ class Trajectory:
     truncated: jax.Array
     goal_position: jax.Array
     provenance: dict[str, str | int]
+    executed_actions: jax.Array
 
     def __len__(self) -> int:
-        """Return the number of actions, which is the episode length.
-
-        Returns:
-            Number of transitions in this episode.
-        """
+        """Return the number of actions, which is the episode length."""
         return int(self.actions.shape[0])

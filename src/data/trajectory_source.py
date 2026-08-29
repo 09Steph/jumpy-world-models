@@ -22,6 +22,7 @@ from src.data.trajectory import (
     Trajectory,
 )
 from src.envs.navix_env import NavixEnv
+from src.envs.slip import SLIP_KEY_FOLD_INDEX, apply_slip
 from src.utils.logging_setup import get_logger
 
 logger = get_logger(__name__)
@@ -74,13 +75,11 @@ class TrajectorySource(Protocol):
 class NavixTrajectorySource:
     """Rolls a uniform-random policy in NAVIX and emits complete episodes.
 
-    Both observation modes are recorded per episode, derived from the same
-    state. NAVIX's step limit produces a truncation, and the two are never
-    merged into a single `done` flag.
-
-    NAVIX auto-resets internally. The observation returned at the boundary step
-    is the endpoint of the episode that just ended, and the fresh reset appears
-    on the following step, where `timestep.t` returns to 0.
+    Both observation modes are recorded per episode from the same state, and
+    termination and truncation are kept as separate streams rather than one
+    `done` flag. NAVIX auto-resets internally, so the observation at the
+    boundary step is the endpoint of the episode that just ended. The fresh
+    reset appears on the next step, where `timestep.t` returns to 0.
 
     Attributes:
         config: Environment configuration.
@@ -90,11 +89,9 @@ class NavixTrajectorySource:
     def __init__(self, config: EnvConfig) -> None:
         """Build a single-environment NAVIX rollout source.
 
-        Rolls one environment at a time, so the episode boundary is
-        unambiguous.
-
         Args:
-            config: Environment configuration. num_envs is overridden to 1.
+            config: Environment configuration. num_envs is overridden to 1, so
+                the episode boundary is unambiguous.
         """
         self.config = config
         self.env = NavixEnv(EnvConfig(
@@ -113,7 +110,8 @@ class NavixTrajectorySource:
     def spec(self, mode: ObservationMode) -> ObservationSpec:
         """Describe NAVIX's observations and action space for one mode.
 
-        Built from config's NAVIX constants here and nowhere else.
+        The only place these constants become an ObservationSpec. `generate.py`
+        validates observations against them and `losses.py` reads them too.
 
         Args:
             mode: The observation mode being described.
@@ -185,9 +183,12 @@ class NavixTrajectorySource:
         observations: dict[ObservationMode, list[jax.Array]] = {
             mode: [self._observe(timestep, mode)[0]] for mode in ObservationMode
         }
-        # One dict, so a new recorded field is a key.
         streams: dict[str, list[jax.Array]] = {
-            name: [] for name in ("actions", "rewards", "terminated", "truncated")
+            name: []
+            for name in (
+                "actions", "rewards", "terminated", "truncated",
+                "executed_actions",
+            )
         }
 
         # NAVIX truncates at max_episode_steps, so this bound is a guard
@@ -195,9 +196,19 @@ class NavixTrajectorySource:
         for _ in range(self.config.max_episode_steps):
             action_key, step_key = jax.random.split(action_key)
             action = jax.random.randint(step_key, (1,), 0, num_actions)
-            timestep = self.env.step(timestep, action)
+            # Folded, not split: step_key must stay usable above or the
+            # commanded action itself changes and slip_probability 0.0 stops
+            # reproducing a pre-slip run.
+            executed = apply_slip(
+                action,
+                jax.random.fold_in(step_key, SLIP_KEY_FOLD_INDEX),
+                self.config.slip_probability,
+                num_actions,
+            )
+            timestep = self.env.step(timestep, executed)
 
             streams["actions"].append(action[0])
+            streams["executed_actions"].append(executed[0])
             streams["rewards"].append(timestep.reward[0])
             streams["terminated"].append(NavixEnv.terminated(timestep)[0])
             streams["truncated"].append(NavixEnv.truncated(timestep)[0])
@@ -222,4 +233,5 @@ class NavixTrajectorySource:
                 "policy": UNIFORM_RANDOM_POLICY,
                 "episode_index": episode_index,
             },
+            executed_actions=jnp.stack(streams["executed_actions"]),
         )

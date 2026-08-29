@@ -33,6 +33,7 @@ from src.data.split import SplitName, TrajectorySplit
 from src.data.tokeniser import check_horizons_valid
 from src.data.trajectory import ObservationMode, Trajectory
 from src.utils.logging_setup import get_logger
+from src.utils.paths import safe_rel
 
 logger = get_logger(__name__)
 
@@ -575,11 +576,10 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
 
         The horizons argument is not bounded by horizon_max, so a model trained
         to h_max can be swept past it without retraining. `check_horizons_valid`
-        is called with the sweep ceiling, so it takes num_action_tokens as an
-        argument instead of reading config.
-
-        Every supporting trajectory contributes the same number of windows at
-        each horizon, so the trajectory carries equal weight.
+        takes num_action_tokens as an argument rather than reading config, so
+        the sweep ceiling can be passed. Every supporting trajectory
+        contributes the same number of windows at each horizon, giving each
+        equal weight.
 
         Args:
             key: JAX PRNG key. One subkey per horizon, so adding a horizon to
@@ -673,13 +673,29 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
 
         Returns:
             The evaluation batch.
+
+        Raises:
+            ValueError: If a frozen file exists whose horizons differ from the
+                requested grid.
         """
         horizons = self.evaluation_horizons
         if self.mode is SamplerMode.ONLINE:
             return self.frozen_evaluation_set(key, horizons)
         path = self._artefact_path(WINDOWS_EVAL_TEMPLATE)
         if path.exists():
-            return read_window_batch(path)
+            batch = read_window_batch(path)
+            stored = tuple(sorted({int(h) for h in np.asarray(batch.horizons)}))
+            wanted = tuple(sorted(set(horizons)))
+            # The filename carries the split and the mode but not the grid, so a
+            # changed grid reaches a file drawn for the old one.
+            if stored != wanted:
+                raise ValueError(
+                    f"frozen evaluation set at {safe_rel(path)} holds horizons "
+                    f"{stored} but this run asks for {wanted}. Delete the file "
+                    "to redraw it; reusing it would score the new grid on the "
+                    "old draw."
+                )
+            return batch
         batch = self.frozen_evaluation_set(key, horizons)
         write_window_batch(path, batch)
         logger.info(
@@ -722,6 +738,9 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
             ValueError: If no pool size was configured. OFFLINE cannot decide
                 on its own how many windows the dataset should hold.
         """
+        # The pool draw and the index draw take separate keys. One key serving
+        # both couples the batch to the pool it is drawn from.
+        pool_key, picks_key = jax.random.split(key)
         if self._offline_pool is None:
             path = self._artefact_path(WINDOWS_TRAIN_TEMPLATE)
             if not path.exists():
@@ -730,11 +749,11 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
                         "OFFLINE mode needs offline_pool_size. from_config "
                         "takes it from train.target_examples"
                     )
-                self.materialise_training_windows(key, self.offline_pool_size)
+                self.materialise_training_windows(pool_key, self.offline_pool_size)
             self._offline_pool = read_window_batch(path)
         pool = self._offline_pool
         picks = np.asarray(
-            jax.random.randint(key, (self.batch_size,), 0, len(pool))
+            jax.random.randint(picks_key, (self.batch_size,), 0, len(pool))
         )
         return select_windows(pool, picks)
 

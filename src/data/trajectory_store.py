@@ -31,9 +31,10 @@ REWARDS_DATASET: str = "rewards"
 TERMINATIONS_DATASET: str = "terminations"
 TRUNCATIONS_DATASET: str = "truncations"
 GOAL_POSITION_DATASET: str = "goal_position"
+EXECUTED_ACTIONS_DATASET: str = "executed_actions"
 PROVENANCE_ATTR: str = "provenance_json"
 SCHEMA_ATTR: str = "schema"
-SCHEMA_NAME: str = "minari-like/v1"
+SCHEMA_NAME: str = "minari-like/v2"
 
 # Per-episode flag fields, in the order they are written.
 FLAG_FIELDS: tuple[tuple[str, str], ...] = (
@@ -42,16 +43,20 @@ FLAG_FIELDS: tuple[tuple[str, str], ...] = (
     (TERMINATIONS_DATASET, "terminated"),
     (TRUNCATIONS_DATASET, "truncated"),
     (GOAL_POSITION_DATASET, "goal_position"),
+    (EXECUTED_ACTIONS_DATASET, "executed_actions"),
 )
+
+# The one dataset a shard may lack, and the dataset it is backfilled from.
+# Every other entry in FLAG_FIELDS is required on read.
+BACKFILLED_FIELD: tuple[str, str] = (EXECUTED_ACTIONS_DATASET, ACTIONS_DATASET)
 
 
 class TrajectoryStore:
     """Write and read complete trajectories in both observation modes.
 
-    One file per shard.
-
-    The round trip preserves dtypes. Observations are uint8, and a read path
-    that promotes them to int64 quadruples the dataset on disk.
+    One file per shard. The round trip preserves dtypes. Observations are
+    uint8, and a read path promoting them to int64 quadruples the dataset on
+    disk.
     """
 
     def write_shard(self, trajectories: Sequence[Trajectory], path: Path) -> None:
@@ -133,9 +138,7 @@ class TrajectoryStore:
             path: Shard file written by write_shard.
 
         Returns:
-            The episodes it holds, in write order. Arrays come back as numpy
-            at their written dtypes. The store is where JAX stops, so a reader
-            pays for no device transfer.
+            The episodes it holds, in write order, as numpy arrays.
         """
         with h5py.File(path, "r") as handle:
             return [
@@ -149,16 +152,13 @@ class TrajectoryStore:
 
         Args:
             group: The episode group.
-
-        Returns:
-            The episode, with arrays at the dtypes they were written with.
         """
         observations = {
             ObservationMode(name): group[OBSERVATIONS_GROUP][name][()]
             for name in group[OBSERVATIONS_GROUP].keys()
         }
         fields = {
-            field_name: group[dataset_name][()]
+            field_name: TrajectoryStore._read_field(group, dataset_name)
             for dataset_name, field_name in FLAG_FIELDS
         }
         return Trajectory(
@@ -166,6 +166,30 @@ class TrajectoryStore:
             provenance=json.loads(group.attrs[PROVENANCE_ATTR]),
             **fields,
         )
+
+    @staticmethod
+    def _read_field(group: h5py.Group, dataset_name: str) -> np.ndarray:
+        """Read one per-episode dataset, backfilling the one v1 shards lack.
+
+        A v1 shard carries no executed-action dataset, and its executed action
+        equals its commanded one, every such shard predating any slip code in
+        this repository.
+
+        Args:
+            group: The episode group.
+            dataset_name: HDF5 dataset to read.
+
+        Returns:
+            The dataset's contents, or the backfill source's when the dataset
+            named by BACKFILLED_FIELD is absent.
+
+        Raises:
+            KeyError: If any other dataset is missing.
+        """
+        backfilled_name, source_name = BACKFILLED_FIELD
+        if dataset_name == backfilled_name and dataset_name not in group:
+            return group[source_name][()]
+        return group[dataset_name][()]
 
     @staticmethod
     def length_statistics(trajectories: Sequence[Trajectory]) -> dict:
@@ -203,13 +227,11 @@ class TrajectoryStore:
     ) -> dict:
         """Measure the stationary-copy and mover-mask statistics, per mode per h.
 
-        No copy-baseline cross-entropy is computed here. It lives with the
-        baseline in `src/eval/baselines.py`, which owns the smoothing
-        convention.
-
-        Measured over all valid (t, t+h) pairs within each trajectory, not over
-        the evaluation windows. These are a property of the generated data, not
-        the baseline the model was scored against.
+        Measured over all valid (t, t+h) pairs within each trajectory rather
+        than over the evaluation windows, so these describe the generated data
+        and not the baseline the model was scored against. No copy-baseline
+        cross-entropy is computed here. It lives with the baseline in
+        `src/eval/baselines.py`, which owns the smoothing convention.
 
         Args:
             trajectories: Episodes to measure.
