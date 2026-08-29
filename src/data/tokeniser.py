@@ -292,7 +292,9 @@ def action_padding_mask(
 
     Args:
         horizons: True horizon per example, shape (batch,).
-        num_action_tokens: Padded sequence length, config's HORIZON_MAX.
+        num_action_tokens: Padded sequence length of the batch in hand.
+            HORIZON_MAX for a training batch, and the evaluation grid's
+            ceiling for an evaluation batch, which may exceed it.
 
     Returns:
         Boolean mask of shape (batch, num_action_tokens), True where the slot
@@ -310,7 +312,9 @@ def check_horizons_valid(horizons: jax.Array, num_action_tokens: int) -> None:
 
     Args:
         horizons: True horizon per example, shape (batch,).
-        num_action_tokens: Padded sequence length, config's HORIZON_MAX.
+        num_action_tokens: Padded sequence length of the batch in hand.
+            HORIZON_MAX for a training batch, and the evaluation grid's
+            ceiling for an evaluation batch, which may exceed it.
 
     Raises:
         ValueError: If any horizon is below MIN_HORIZON or above the padded
