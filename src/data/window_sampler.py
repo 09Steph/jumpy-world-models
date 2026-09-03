@@ -41,7 +41,7 @@ logger = get_logger(__name__)
 # any valid index would do. Zero is inert if the mask is ever dropped.
 PAD_ACTION_INDEX: int = 0
 
-# Bytes per int32 action slot, named so bytes_per_window has no bare 4 in it.
+# Bytes per int32 action slot.
 ACTION_INDEX_BYTES: int = 4
 
 # HDF5 dataset and attribute names for a stored window batch.
@@ -84,11 +84,7 @@ class WindowBatch:
     observation_mode: ObservationMode
 
     def __len__(self) -> int:
-        """Return the number of examples.
-
-        Returns:
-            Batch size.
-        """
+        """Return the number of examples."""
         return int(self.horizons.shape[0])
 
 
@@ -188,9 +184,7 @@ def read_window_batch(path: Path) -> WindowBatch:
 class WindowSampler:  # pylint: disable=too-many-instance-attributes
     """Draws (s_t, a_{t:t+h}, s_{t+h}) examples from one split.
 
-    The pool is numpy in host memory, the PRNG is JAX. It sits alongside the
-    three lookup tables that index it, which is what puts the attribute count
-    over pylint's default.
+    The pool is numpy in host memory, the PRNG is JAX.
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -218,9 +212,9 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
                 TrajectorySplit.
             split: The partition being sampled, carried into every batch.
             observation_mode: The single mode this sampler emits.
-            horizon_min: Smallest horizon to draw. One, never zero.
+            horizon_min: Smallest horizon to draw.
             horizon_max: Largest horizon to draw, and the padded action length
-                for training batches. Read from config, never a literal.
+                for training batches.
             batch_size: Examples per training batch.
             mode: Where training and evaluation windows come from.
             artefact_dir: Directory for the frozen evaluation file and the
@@ -317,7 +311,7 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
             batch_size=config.train.batch_size,
             mode=config.sampler.mode,
             artefact_dir=data_dir(
-                config.run_name, config.data_seed, config.fast
+                config.run_name, config.data_seed, config.fast, config.env.name
             ),
             offline_byte_budget=config.sampler.offline_byte_budget,
             evaluation_horizons=config.sampler.evaluation_horizons,
@@ -332,8 +326,7 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
     ) -> tuple[np.ndarray, np.ndarray]:
         """Pad this split's episodes into two rectangular arrays.
 
-        A rectangular pool makes a batch one fancy-index instead of a Python
-        loop. The padding is never read; a window satisfies t + h <= L by
+        The padding is never read; a window satisfies t + h <= L by
         construction.
 
         Args:
@@ -374,7 +367,7 @@ class WindowSampler:  # pylint: disable=too-many-instance-attributes
         )
 
     def _build_window_count_table(self) -> np.ndarray:
-        """Return, for each horizon, how many DISTINCT windows this split holds.
+        """Return, for each horizon, how many distinct windows this split holds.
 
         sum_i max(0, L_i - h + 1). Goes into every batch and every emitted
         table. Equal sampling frequency across horizons does not mean equal

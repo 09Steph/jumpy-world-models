@@ -90,12 +90,6 @@ class TrajectorySplit:
     def composition_for(self, name: SplitName) -> SplitComposition:
         """Return the descriptive statistics for one split.
 
-        Args:
-            name: Which partition to read.
-
-        Returns:
-            That split's composition record.
-
         Raises:
             KeyError: If the partition carries no record for that split.
         """
@@ -108,8 +102,8 @@ class TrajectorySplit:
         """Return a JSON-serialisable record of this partition.
 
         Returns:
-            Mapping of split sizes, indices, seed, attempt count and the
-            per-split composition.
+            Mapping of split sizes, indices, seed, attempt count, the pooled
+            support fraction and the per-split composition.
         """
         return {
             "split_seed": self.split_seed,
@@ -142,7 +136,7 @@ def _validate_split_inputs(
     Args:
         num_trajectories: Trajectories being partitioned.
         horizon_max: Ceiling used for the support check.
-        fractions: The three split shares, keyed by argument name.
+        fractions: The split shares, keyed by argument name.
         support_tolerance: Allowed deviation in horizon-support fraction.
         max_redraw_attempts: Redraw bound.
 
@@ -237,6 +231,71 @@ def _compose(
     )
 
 
+def _apportion(sizes: dict[str, int], quota: int) -> dict[str, int]:
+    """Divide a quota across strata in proportion to their sizes.
+
+    Largest remainder, so the per-stratum counts sum to the quota exactly.
+
+    Args:
+        sizes: Trajectories per stratum.
+        quota: Total to divide.
+
+    Returns:
+        The quota per stratum.
+    """
+    total = sum(sizes.values())
+    exact = {key: size * quota / total for key, size in sizes.items()}
+    counts = {key: int(value) for key, value in exact.items()}
+    shortfall = quota - sum(counts.values())
+    by_remainder = sorted(sizes, key=lambda key: (counts[key] - exact[key], key))
+    for key in by_remainder[:shortfall]:
+        counts[key] += 1
+    return counts
+
+
+def _stratified_order(
+    strata: Sequence[str], num_train: int, num_validation: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Order indices so the global split slices allocate each stratum in share.
+
+    Args:
+        strata: Stratum label per trajectory, in store order.
+        num_train: Global training count.
+        num_validation: Global validation count.
+        rng: Draw for this attempt.
+
+    Returns:
+        An index order whose first num_train entries hold each stratum's
+        training share, and so on for validation and test.
+
+    Raises:
+        ValueError: If a stratum is too small to give up its allocated share.
+    """
+    groups: dict[str, list[int]] = {}
+    for index, label in enumerate(strata):
+        groups.setdefault(str(label), []).append(index)
+    sizes = {label: len(members) for label, members in groups.items()}
+    train_counts = _apportion(sizes, num_train)
+    validation_counts = _apportion(sizes, num_validation)
+
+    train, validation, test = [], [], []
+    for label in sorted(groups):
+        allocated = train_counts[label] + validation_counts[label]
+        if allocated > sizes[label]:
+            raise ValueError(
+                f"stratum '{label}' holds {sizes[label]} trajectories and "
+                f"was allocated {allocated} to train and validation. Draw "
+                "more trajectories from it rather than borrowing from another "
+                "stratum, which is what stratifying exists to prevent"
+            )
+        shuffled = rng.permutation(np.asarray(groups[label], dtype=np.int64))
+        train.append(shuffled[: train_counts[label]])
+        validation.append(shuffled[train_counts[label] : allocated])
+        test.append(shuffled[allocated:])
+    return np.concatenate(train + validation + test)
+
+
 def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
     lengths: Sequence[int],
     *,
@@ -247,6 +306,7 @@ def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
     test_fraction: float,
     support_tolerance: float,
     max_redraw_attempts: int,
+    strata: Sequence[str] | None = None,
 ) -> TrajectorySplit:
     """Partition trajectory indices three ways, by trajectory, with a check.
 
@@ -265,13 +325,17 @@ def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
         support_tolerance: Maximum allowed deviation in horizon-support
             fraction, as a proportion.
         max_redraw_attempts: Redraw bound before raising.
+        strata: Optional stratum label per trajectory, in store order. When
+            given, each split takes every stratum's proportional share, and
+            the horizon-support check still applies to the result.
 
     Returns:
         The partition, with its composition statistics and attempt count.
 
     Raises:
         ValueError: If the fractions do not partition, if any split would be
-            empty, or if the composition check fails max_redraw_attempts times.
+            empty, if a stratum is too small for its share, or if the
+            composition check fails max_redraw_attempts times.
     """
     fractions = {
         "train_fraction": train_fraction,
@@ -286,6 +350,12 @@ def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
         support_tolerance,
         max_redraw_attempts,
     )
+    if strata is not None and len(strata) != int(lengths_array.size):
+        raise ValueError(
+            f"strata carries {len(strata)} labels for "
+            f"{int(lengths_array.size)} trajectories. One label per "
+            "trajectory, in store order"
+        )
     num_train, num_validation, _ = _allocate_counts(
         int(lengths_array.size), train_fraction, validation_fraction
     )
@@ -294,7 +364,10 @@ def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
     worst_deviation = float("inf")
     for attempt in range(1, max_redraw_attempts + 1):
         rng = np.random.default_rng(split_seed + attempt - 1)
-        order = rng.permutation(int(lengths_array.size))
+        if strata is None:
+            order = rng.permutation(int(lengths_array.size))
+        else:
+            order = _stratified_order(strata, num_train, num_validation, rng)
         parts = {
             SplitName.TRAIN: order[:num_train],
             SplitName.VALIDATION: order[num_train : num_train + num_validation],
@@ -345,7 +418,9 @@ def split_trajectories(  # pylint: disable=too-many-arguments,too-many-locals
 
 
 def split_from_config(
-    config: ExperimentConfig, lengths: Sequence[int]
+    config: ExperimentConfig,
+    lengths: Sequence[int],
+    strata: Sequence[str] | None = None,
 ) -> TrajectorySplit:
     """Draw the partition an experiment configuration implies.
 
@@ -354,6 +429,7 @@ def split_from_config(
     Args:
         config: The composed experiment configuration.
         lengths: Episode length per trajectory, in store order.
+        strata: Optional stratum label per trajectory, in store order.
 
     Returns:
         The three-way partition, with its composition statistics.
@@ -370,6 +446,7 @@ def split_from_config(
         test_fraction=config.data.test_fraction,
         support_tolerance=SPLIT_SUPPORT_TOLERANCE,
         max_redraw_attempts=SPLIT_MAX_REDRAW_ATTEMPTS,
+        strata=strata,
     )
 
 

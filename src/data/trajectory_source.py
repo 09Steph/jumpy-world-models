@@ -5,6 +5,7 @@ A source yields finished episodes and describes its own observations.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Iterator, Protocol, runtime_checkable
 
 import jax
@@ -48,7 +49,7 @@ class TrajectorySource(Protocol):
     """A source of complete trajectories for offline training.
 
     Implemented by NavixTrajectorySource, a live rollout of a uniform-random
-    policy.
+    policy, and by KatakombaTrajectorySource, which reads a recorded corpus.
     """
 
     def spec(self, mode: ObservationMode) -> ObservationSpec:
@@ -94,12 +95,9 @@ class NavixTrajectorySource:
                 the episode boundary is unambiguous.
         """
         self.config = config
-        self.env = NavixEnv(EnvConfig(
-            name=config.name,
-            num_envs=1,
-            max_episode_steps=config.max_episode_steps,
-            penality_coeff=config.penality_coeff,
-        ))
+        # replace() rather than a field-by-field rebuild, which silently drops
+        # any field the dataclass gains.
+        self.env = NavixEnv(replace(config, num_envs=1))
         logger.info(
             "NavixTrajectorySource ready: name=%s max_steps=%d policy=%s",
             config.name,

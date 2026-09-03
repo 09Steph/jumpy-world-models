@@ -36,7 +36,7 @@ PROVENANCE_ATTR: str = "provenance_json"
 SCHEMA_ATTR: str = "schema"
 SCHEMA_NAME: str = "minari-like/v2"
 
-# Per-episode flag fields, in the order they are written.
+# Per-episode datasets, in the order they are written.
 FLAG_FIELDS: tuple[tuple[str, str], ...] = (
     (ACTIONS_DATASET, "actions"),
     (REWARDS_DATASET, "rewards"),
@@ -59,26 +59,37 @@ class TrajectoryStore:
     disk.
     """
 
-    def write_shard(self, trajectories: Sequence[Trajectory], path: Path) -> None:
+    def write_shard(
+        self,
+        trajectories: Sequence[Trajectory],
+        path: Path,
+        compression: int | None = None,
+    ) -> None:
         """Write one shard of trajectories to an HDF5 file.
 
         Args:
             trajectories: Episodes to write. May be empty, which writes a valid
                 shard carrying zero episode groups.
             path: Destination file. Parent directories are created.
+            compression: gzip level, or None to store uncompressed. Off by
+                default, so an existing shard is written byte for byte as
+                before.
         """
         ensure_dir(path.parent)
         with h5py.File(path, "w") as handle:
             handle.attrs[SCHEMA_ATTR] = SCHEMA_NAME
             for index, trajectory in enumerate(trajectories):
-                self._write_episode(handle, index, trajectory)
+                self._write_episode(handle, index, trajectory, compression)
         logger.info(
             "wrote %d trajectories -> %s", len(trajectories), safe_rel(path)
         )
 
     @staticmethod
     def _write_episode(
-        handle: h5py.File, index: int, trajectory: Trajectory
+        handle: h5py.File,
+        index: int,
+        trajectory: Trajectory,
+        compression: int | None = None,
     ) -> None:
         """Write one episode group.
 
@@ -86,16 +97,44 @@ class TrajectoryStore:
             handle: Open HDF5 file.
             index: Position of this episode within the shard.
             trajectory: The episode to write.
+            compression: gzip level, or None to store uncompressed.
         """
         group = handle.create_group(EPISODE_GROUP_TEMPLATE.format(index=index))
         group.attrs[PROVENANCE_ATTR] = json.dumps(trajectory.provenance)
         observations = group.create_group(OBSERVATIONS_GROUP)
         for mode, frames in trajectory.observations.items():
-            observations.create_dataset(mode.value, data=np.asarray(frames))
-        for dataset_name, field_name in FLAG_FIELDS:
-            group.create_dataset(
-                dataset_name, data=np.asarray(getattr(trajectory, field_name))
+            TrajectoryStore._create(
+                observations, mode.value, np.asarray(frames), compression
             )
+        for dataset_name, field_name in FLAG_FIELDS:
+            TrajectoryStore._create(
+                group,
+                dataset_name,
+                np.asarray(getattr(trajectory, field_name)),
+                compression,
+            )
+
+    @staticmethod
+    def _create(
+        group: h5py.Group, name: str, data: np.ndarray, compression: int | None
+    ) -> None:
+        """Create one dataset, compressed where compression is possible.
+
+        gzip requires chunked storage and an empty dataset cannot be chunked,
+        so a zero-sized field is written uncompressed whatever the level.
+
+        Args:
+            group: Destination group.
+            name: Dataset name.
+            data: Contents.
+            compression: gzip level, or None to store uncompressed.
+        """
+        if compression is None or data.size == 0:
+            group.create_dataset(name, data=data)
+            return
+        group.create_dataset(
+            name, data=data, compression="gzip", compression_opts=compression
+        )
 
     def read_dataset(self, directory: Path, consumer: str) -> list[Trajectory]:
         """Read every shard one dataset directory holds, in shard order.
@@ -172,8 +211,8 @@ class TrajectoryStore:
         """Read one per-episode dataset, backfilling the one v1 shards lack.
 
         A v1 shard carries no executed-action dataset, and its executed action
-        equals its commanded one, every such shard predating any slip code in
-        this repository.
+        equals its commanded one, because every such shard predates any slip
+        code.
 
         Args:
             group: The episode group.
