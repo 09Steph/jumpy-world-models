@@ -182,7 +182,7 @@ class OfflineGenerateStage(Stage):
         change what the shards contain, so each has to be here. Left out, a
         rerun at a different setting matches this sentinel and trains on the
         previous dataset. HORIZON_MAX is one such setting and is absent; see
-        `offline_sources._katakomba_source`.
+        `offline_sources`.
 
         Returns:
             JSON-serialisable identity and integrity fields.
