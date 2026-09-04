@@ -7,12 +7,14 @@ from typing import Any, Sequence
 
 import numpy as np
 from rliable import library as rliable_library
-from rliable import metrics as rliable_metrics
 
 # Bootstrap parameters, recorded in the artefact.
 BOOTSTRAP_REPS: int = 50_000
 BOOTSTRAP_SEED: int = 42
 CONFIDENCE_INTERVAL_SIZE: float = 0.95
+
+# The fraction trimmed from each end of the sorted scores before averaging.
+IQM_PROPORTION_TO_CUT: float = 0.25
 
 # Minimum seeds an IQM is meaningful over. Below this it is reported as
 # absent, never as a number.
@@ -26,13 +28,21 @@ STD_DDOF: int = 1
 def iqm_of(scores: np.ndarray) -> np.ndarray:
     """Return the interquartile mean of a (runs, tasks) score array.
 
+    Trims `IQM_PROPORTION_TO_CUT` from each end of the flattened scores and
+    averages the rest, matching `scipy.stats.trim_mean` operation for operation
+    including its use of `np.partition`.
+
     Args:
         scores: Scores shaped (num_runs, num_tasks).
 
     Returns:
         A one-element array, the shape rliable's bootstrap resamples through.
     """
-    return np.array([rliable_metrics.aggregate_iqm(scores)])
+    flat = np.asarray(scores, dtype=np.float64).ravel()
+    lowercut = int(IQM_PROPORTION_TO_CUT * flat.shape[0])
+    uppercut = flat.shape[0] - lowercut
+    trimmed = np.partition(flat, (lowercut, uppercut - 1))
+    return np.array([np.mean(trimmed[lowercut:uppercut])])
 
 
 def sample_std(values: Sequence[float]) -> float:
@@ -42,8 +52,8 @@ def sample_std(values: Sequence[float]) -> float:
         values: One metric's value on each seed.
 
     Returns:
-        The sample standard deviation, or 0.0 for a single value where it is
-        undefined.
+        The sample standard deviation, or 0.0 for fewer than two values,
+        where it is undefined.
     """
     if len(values) < 2:
         return 0.0
@@ -57,44 +67,12 @@ def horizon_mean(series: Sequence[float] | None) -> float | None:
         series: A per-step metric series from an artefact.
 
     Returns:
-        The horizon mean, or None where no window survived episode-boundary
-        masking, which is not the same as a mean of zero.
+        The horizon mean, or None where the series is absent or empty, which
+        is not the same as a mean of zero.
     """
     if not series:
         return None
     return float(sum(series)) / len(series)
-
-
-def delta(model: float | None, baseline: float | None) -> float | None:
-    """Return the model-minus-baseline gap, or None if either side is absent.
-
-    Args:
-        model: The model's horizon-mean accuracy.
-        baseline: The stationary-agent baseline's horizon-mean accuracy.
-    """
-    if model is None or baseline is None:
-        return None
-    return model - baseline
-
-
-def steps_ahead(
-    model: Sequence[float] | None, baseline: Sequence[float] | None
-) -> float | None:
-    """Return how many horizon steps the model beats the baseline at.
-
-    Strictly greater. Matching a baseline that assumes the agent never moved
-    is not beating it. Ragged inputs are truncated to the shorter series.
-
-    Args:
-        model: Per-step model accuracy.
-        baseline: Per-step stationary-agent accuracy.
-
-    Returns:
-        The count of steps ahead, or None if either series is absent.
-    """
-    if not model or not baseline:
-        return None
-    return float(sum(one > two for one, two in zip(model, baseline)))
 
 
 def aggregate_scalar(
@@ -142,31 +120,3 @@ def aggregate_scalar(
     block["ci_low"] = float(interval["metric"][0][0])
     block["ci_high"] = float(interval["metric"][1][0])
     return block
-
-
-def aggregate_vector(per_seed: Sequence[Sequence[float] | None]) -> list[dict]:
-    """Aggregate a per-step vector across seeds, position by position.
-
-    Truncates to the shortest series present, so a short seed silently drops
-    the tail of every longer one.
-
-    Args:
-        per_seed: Each seed's per-step series.
-
-    Returns:
-        One {step, mean, std, n} entry per horizon position, 1-indexed. Empty
-        when no seed carries the series.
-    """
-    usable = [series for series in per_seed if series]
-    if not usable:
-        return []
-    length = min(len(series) for series in usable)
-    return [
-        {
-            "step": index + 1,
-            "mean": float(sum(series[index] for series in usable) / len(usable)),
-            "std": sample_std([series[index] for series in usable]),
-            "n": len(usable),
-        }
-        for index in range(length)
-    ]

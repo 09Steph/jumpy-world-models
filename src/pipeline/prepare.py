@@ -1,12 +1,8 @@
-"""Dataset preparation stage: partition a generated dataset and freeze its
-evaluation windows.
+"""Dataset preparation stage: partition a dataset and freeze its windows.
 
 Decides which trajectories are training data, which are held out during
 development and which are opened once for the reported result. Splitting is by
 trajectory, never by sample. Two windows from one episode overlap.
-
-Under ONLINE sampling the windows are reproducible only from a seed plus the
-sampler code, so a refactor changes them silently. A file on disk cannot drift.
 """
 
 from __future__ import annotations
@@ -19,6 +15,7 @@ import jax
 from config import (
     EVALUATED_SPLITS,
     SPLIT_PROVENANCE_FILENAME,
+    STRATUM_PROVENANCE_KEY,
     ExperimentConfig,
 )
 from src.data.split import SplitName, split_from_config
@@ -36,9 +33,9 @@ def frozen_evaluation_key(config: ExperimentConfig, name: SplitName) -> jax.Arra
     """Return the PRNG key one split's frozen evaluation windows are drawn with.
 
     One key per (data seed, split), so the frozen set is reproducible from the
-    dataset alone and two splits cannot draw the same offsets. Module-level:
-    the evaluator asks the same question, and a second derivation would score a
-    different set while every shape agreed.
+    dataset alone and two splits cannot draw the same offsets. Module-level
+    because the evaluator asks the same question, and a second derivation would
+    score a different set while every shape agreed.
 
     Args:
         config: The composed experiment configuration.
@@ -60,6 +57,36 @@ def frozen_evaluation_key(config: ExperimentConfig, name: SplitName) -> jax.Arra
         jax.random.PRNGKey(config.data_seed),
         EVALUATED_SPLITS.index(name.value),
     )
+
+
+def strata_for(trajectories: list[Trajectory]) -> list[str] | None:
+    """Return the stratum label per trajectory, or None if none carries one.
+
+    Args:
+        trajectories: Every episode in this dataset, in store order.
+
+    Returns:
+        One label per trajectory, or None when the dataset is unstratified.
+
+    Raises:
+        ValueError: If only some episodes carry a label. A partial set would
+            otherwise fall back to an unstratified draw on a dataset that was
+            meant to be stratified.
+    """
+    labels = [
+        trajectory.provenance.get(STRATUM_PROVENANCE_KEY)
+        for trajectory in trajectories
+    ]
+    present = [label for label in labels if label is not None]
+    if not present:
+        return None
+    if len(present) != len(labels):
+        raise ValueError(
+            f"{len(present)} of {len(labels)} episodes carry "
+            f"'{STRATUM_PROVENANCE_KEY}'. A stratified split needs a label on "
+            f"every episode."
+        )
+    return [str(label) for label in labels]
 
 
 class PrepareDatasetStage(Stage):
@@ -93,11 +120,7 @@ class PrepareDatasetStage(Stage):
         return f"{self.name}_{self.config.sampler.observation_mode}"
 
     def __init__(self, config: ExperimentConfig) -> None:
-        """Build the stage.
-
-        Args:
-            config: The composed experiment configuration.
-        """
+        """Build the stage."""
         super().__init__(config)
         self.store = TrajectoryStore()
 
@@ -134,9 +157,18 @@ class PrepareDatasetStage(Stage):
         """
         # split_from_config, not a hand-assembled call, or two stages could
         # drift onto different partitions.
+        strata = strata_for(trajectories)
         split = split_from_config(
-            self.config, [len(trajectory) for trajectory in trajectories]
+            self.config,
+            [len(trajectory) for trajectory in trajectories],
+            strata=strata,
         )
+        if strata is not None:
+            logger.info(
+                "split stratified on '%s' across %d strata",
+                STRATUM_PROVENANCE_KEY,
+                len(set(strata)),
+            )
         for composition in split.composition:
             logger.info(
                 "split %-10s n=%-5d mean=%-7.1f median=%-6.1f support=%.4f",
@@ -197,9 +229,10 @@ class PrepareDatasetStage(Stage):
     def sentinel_identity(self) -> dict:
         """Return the identity guarding this dataset's partition and windows.
 
-        Carries the split fractions, the horizon ceiling, the evaluation grid
-        and the mode, each of which changes what the frozen files contain while
-        leaving their paths identical.
+        Carries the trajectory count, the split fractions, the horizon ceiling,
+        the evaluated splits and the sampler's own fields, each of which
+        changes what the frozen files contain while leaving their paths
+        identical.
 
         Returns:
             JSON-serialisable identity fields.

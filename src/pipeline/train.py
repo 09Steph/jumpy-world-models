@@ -28,11 +28,15 @@ from config import (
     ARM_AR_ONE_STEP,
     ARM_DIRECT,
     ARMS,
-    NAVIX_MAX_GRID_EXTENT,
+    ENV_FAMILY_NAVIX,
+    ENV_FAMILY_NLE,
+    OFFLINE_SOURCE,
     ExperimentConfig,
     SamplerMode,
     checkpoints_dir,
+    env_family,
 )
+from src.data.offline_sources import build_offline_source
 from src.data.split import (
     SplitName,
     TrajectorySplit,
@@ -87,8 +91,7 @@ CHECKPOINT_TOTAL_STEPS_KEY: str = "total_steps"
 # Parameter-count summary. The mode is in the name; the content differs by mode.
 PARAMETER_COUNT_TEMPLATE: str = "parameter_count_{mode}.json"
 
-# The horizon arm 3's one-step objective trains at. A bare 1 would read as an
-# off-by-one guard.
+# The horizon arm 3's one-step objective trains at.
 ONE_STEP_HORIZON: int = 1
 
 
@@ -243,7 +246,7 @@ def count_parameters(params: dict) -> int:
 
 
 def save_checkpoint(directory: Path, state: dict) -> None:
-    """Write params, optimiser state and step, and WAIT for the write.
+    """Write params, optimiser state and step, and wait for the write.
 
     The save is asynchronous, so `wait_until_finished()` is not optional, and
     `force=True` is needed to overwrite. Retention keeps exactly one checkpoint,
@@ -278,15 +281,46 @@ def restore_checkpoint(directory: Path, target: dict) -> dict:
     return checkpointer.restore(directory, target=target)
 
 
+def build_training_source(config: ExperimentConfig):
+    """Return the trajectory source the configured environment is described by.
+
+    The model builder needs the source only for its spec. The live NAVIX source
+    is constructed here; an offline family delegates to build_offline_source,
+    which owns the one table mapping a corpus name to its reader.
+
+    Args:
+        config: The composed experiment configuration.
+
+    Returns:
+        A source answering spec(observation_mode).
+
+    Raises:
+        ValueError: If the environment's family has no source. env_family
+            raises first for an environment matching no declared prefix.
+    """
+    family = env_family(config.env.name)
+    if family == ENV_FAMILY_NAVIX:
+        return NavixTrajectorySource(config.env)
+    if family == ENV_FAMILY_NLE:
+        source, _ = build_offline_source(OFFLINE_SOURCE)
+        return source
+    raise ValueError(
+        f"no trajectory source is wired for environment family '{family}'. "
+        f"Add one to build_training_source rather than letting the NAVIX "
+        f"source describe another family's observation."
+    )
+
+
 def build_arm(
     config: ExperimentConfig, observation_mode: ObservationMode, *, arm: int
 ):
     """Construct one arm for one observation mode and initialise its parameters.
 
     One builder for every arm, so the matched parameter budget holds by
-    construction. Module-level: the evaluator restores this stage's checkpoint
-    against a template and has to build a structurally identical model. The
-    configured extent fixes encoder depth at the value both modes share.
+    construction. Module-level because the evaluator restores this stage's
+    checkpoint against a template and has to build a structurally identical
+    model. The configured extent fixes encoder depth at the value both modes
+    share.
 
     Args:
         config: The composed experiment configuration.
@@ -301,12 +335,14 @@ def build_arm(
     """
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}, expected one of {ARMS}")
-    source = NavixTrajectorySource(config.env)
+    source = build_training_source(config)
     spec = source.spec(observation_mode)
     builder = (
         jumpy_transformer_for_spec if arm == ARM_DIRECT else ar_baseline_for_spec
     )
-    model = builder(spec, config.model, depth_extent=NAVIX_MAX_GRID_EXTENT)
+    model = builder(
+        spec, config.model, depth_extent=config.env.max_grid_extent
+    )
     field = spec.single_field()
     height, width = field.shape
     init_key = jax.random.PRNGKey(config.model_seed)
@@ -325,7 +361,7 @@ def build_arm(
         observation_mode.value,
         height,
         width,
-        NAVIX_MAX_GRID_EXTENT,
+        config.env.max_grid_extent,
         count_parameters(params),
     )
     return model, params
@@ -402,7 +438,7 @@ class TrainStage(ArmScopedStage):
 
     @property
     def training_horizon_max(self) -> int:
-        """Return the largest horizon THIS ARM's training batches are drawn at.
+        """Return the largest horizon this arm's training batches are drawn at.
 
         Arm 3's one-step objective is a horizon distribution, not a different
         loss, so h = 1 here is the objective.
@@ -416,7 +452,7 @@ class TrainStage(ArmScopedStage):
 
     @property
     def training_config(self) -> ExperimentConfig:
-        """Return the configuration this arm's TRAINING sampler is built from.
+        """Return the configuration this arm's training sampler is built from.
 
         A local derivation, not a change to `self.config`, which every artefact
         records. Arm 3 trains at h = 1 and is evaluated across the full grid by
@@ -450,8 +486,7 @@ class TrainStage(ArmScopedStage):
         )
 
     def run(self) -> None:
-        """Load, partition, train, decode, and checkpoint.
-        """
+        """Load, partition, train, decode, and checkpoint."""
 
         trajectories = self._load_trajectories()
         split = self._partition(trajectories)
@@ -512,9 +547,6 @@ class TrainStage(ArmScopedStage):
     def _load_trajectories(self) -> list[Trajectory]:
         """Read every shard this data seed's dataset holds.
 
-        Args:
-            None.
-
         Returns:
             All complete episodes, in shard order.
 
@@ -549,7 +581,7 @@ class TrainStage(ArmScopedStage):
 
     @property
     def _training_method(self):
-        """Return the model method this arm's LOSS is computed through.
+        """Return the model method this arm's loss is computed through.
 
         Arm 1 uses `__call__`, its one-shot forward pass. Arms 2 and 3 use
         `rollout_tokens`, the differentiable token-space rollout, their own
@@ -615,8 +647,6 @@ class TrainStage(ArmScopedStage):
         )
 
     def _train(  # pylint: disable=too-many-locals
-        # Over pylint's limit by the validation batch, the timer and the
-        # synced loss.
         self,
         model,
         params,
@@ -732,9 +762,9 @@ class TrainStage(ArmScopedStage):
         The batch is unpacked to arrays at the boundary. `WindowBatch` is a
         frozen dataclass, not a pytree, and cannot cross `jit`. `model` is
         closed over, so it compiles once, and the optimiser update stays inside
-        the boundary. **Compilation changes operation fusion, so results shift
+        the boundary. Compilation changes operation fusion, so results shift
         bitwise against the uncompiled path and a reporting set must come from
-        one code path.**
+        one code path.
 
         Args:
             model: The unbound model for this arm.
@@ -747,7 +777,6 @@ class TrainStage(ArmScopedStage):
         """
 
         @jax.jit
-        # The state plus the batch. An object cannot cross a jit boundary.
         def step(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             params, opt_state, states, actions, horizons, targets, dropout_key
         ):
@@ -807,8 +836,8 @@ class TrainStage(ArmScopedStage):
     ) -> float | None:
         """Emit this step's progress line if one is due, and return its loss.
 
-        Returns the synced training loss, which best-model tracking also
-        needs. Both losses are taken at `state.params`, before the update.
+        Returns the validation loss, which best-model tracking also needs.
+        Both losses are taken at `state.params`, before the update.
 
         Args:
             state: The state before this step's update.
@@ -1136,7 +1165,7 @@ class TrainStage(ArmScopedStage):
                     "objective": self.objective,
                     "observation_mode": self.config.sampler.observation_mode,
                     "parameters": count_parameters(state.params),
-                    "depth_extent": NAVIX_MAX_GRID_EXTENT,
+                    "depth_extent": self.config.env.max_grid_extent,
                     "training_horizon_max": self.training_horizon_max,
                     "completed_steps": state.step,
                     "best_loss": state.best_loss,
@@ -1191,7 +1220,7 @@ class TrainStage(ArmScopedStage):
                 "encoder_channels": list(self.config.model.encoder_channels),
                 "decoder_channels": list(self.config.model.decoder_channels),
                 "state_tokens": self.config.model.state_tokens,
-                "depth_extent": NAVIX_MAX_GRID_EXTENT,
+                "depth_extent": self.config.env.max_grid_extent,
             }
         )
         return identity

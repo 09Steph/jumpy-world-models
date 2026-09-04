@@ -1,9 +1,11 @@
 """Derived run manifest: a view over the sentinels, never an authority.
 
-Records which seeds completed, in which environment, under which mode. Never an
-input to a skip decision: it reads the same `sentinels.stage_state` call the
-pipeline skips on. No dates in any path. The generation time is a field, and a
-dated directory would mean no sentinel is ever found again.
+Records which seeds completed, in which environment, under which mode. It reads
+the same `sentinels.stage_state` call the pipeline skips on, and is never an
+input to a skip decision.
+
+No dates in any path. The generation time is a field, and a dated directory
+would leave every sentinel unfindable.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from config import (
-    CANONICAL_STAGES,
     CONFIG_DIGEST_LENGTH,
     MANIFEST_SCHEMA_VERSION,
     OBS_MODES,
@@ -23,40 +24,22 @@ from config import (
     ExperimentConfig,
     config_snapshot,
     data_dir,
+    dataset_stage_names,
     run_manifest_path,
 )
-from src.pipeline.displacement import DisplacementDiagnostic
-from src.pipeline.generate import GenerateTrajectoriesStage
-from src.pipeline.prepare import PrepareDatasetStage
+from src.pipeline.stage_registry import DATASET_STAGE_CLASSES
 from src.utils.logging_setup import get_logger
 from src.utils.paths import ensure_dir, safe_rel
 from src.utils.sentinels import stage_state
 
 logger = get_logger(__name__)
 
-_STAGE_CLASSES = (
-    GenerateTrajectoriesStage,
-    PrepareDatasetStage,
-    DisplacementDiagnostic,
-)
-if tuple(cls.name for cls in _STAGE_CLASSES) != CANONICAL_STAGES:
-    # A raise, not an assert, which vanishes under `python -O`.
-    raise RuntimeError(
-        "CANONICAL_STAGES and _STAGE_CLASSES have drifted: "
-        f"{CANONICAL_STAGES} against "
-        f"{tuple(cls.name for cls in _STAGE_CLASSES)}"
-    )
-
 
 def config_digest(config: ExperimentConfig) -> str:
     """Return a short stable hash of the provenance fields of a config.
 
     Hashes `config_snapshot`, the curated fields that change what the numbers
-    mean, and not the whole tree. Hashing everything would move the digest on
-    cosmetic edits.
-
-    Args:
-        config: The composed experiment configuration.
+    mean, not the whole tree.
 
     Returns:
         The first CONFIG_DIGEST_LENGTH hex characters of the SHA-256 digest.
@@ -68,16 +51,10 @@ def config_digest(config: ExperimentConfig) -> str:
 def _entry(config: ExperimentConfig, observation_mode: str, data_seed: int) -> dict:
     """Build one manifest entry for a single (environment, mode, data seed).
 
-    Args:
-        config: The base configuration for the run.
-        observation_mode: The observation mode this entry describes.
-        data_seed: The data seed this entry describes.
-
     Returns:
         One JSON-serialisable manifest entry.
     """
-    # model_seed follows data_seed, matching the runner. runner imports
-    # manifest, so the rule cannot be shared without a cycle.
+    # model_seed follows data_seed, matching the runner.
     scoped = replace(
         config,
         seed=data_seed,
@@ -89,11 +66,13 @@ def _entry(config: ExperimentConfig, observation_mode: str, data_seed: int) -> d
         scoped.run_name, data_seed, scoped.fast, scoped.env.name
     )
     stages = {}
-    for stage_class in _STAGE_CLASSES:
-        stage = stage_class(scoped)
+    # The runner's own rule, so the manifest cannot ask for a stage the run
+    # never has. An entry keyed on one would never reach `done`.
+    for stage_name in dataset_stage_names(scoped.env.name):
+        stage = DATASET_STAGE_CLASSES[stage_name](scoped)
         # Keyed by `name`, looked up by `sentinel_key`. They differ for the
         # mode-scoped stage.
-        stages[stage_class.name] = stage_state(
+        stages[stage_name] = stage_state(
             stage.sentinel_key,
             scoped.run_name,
             stage.artefact_seed,
@@ -115,10 +94,8 @@ def build_manifest(config: ExperimentConfig) -> dict:
     """Build the derived manifest for one run in one environment.
 
     Reports every observation mode and every reporting seed regardless of what
-    this invocation ran. The question it answers is what is outstanding.
-
-    Args:
-        config: The base configuration for the run.
+    this invocation ran. OBS_MODES is not per environment, so an environment
+    with one meaningful mode carries entries that can never reach `done`.
 
     Returns:
         The manifest as a JSON-serialisable mapping.
@@ -139,9 +116,6 @@ def build_manifest(config: ExperimentConfig) -> dict:
 
 def write_manifest(config: ExperimentConfig) -> dict:
     """Write the derived manifest to the run's environment directory.
-
-    Args:
-        config: The base configuration for the run.
 
     Returns:
         The manifest that was written.
