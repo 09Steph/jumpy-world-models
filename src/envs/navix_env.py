@@ -10,12 +10,42 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import jax
+import jax.numpy as jnp
 import navix
 
 from config import EnvConfig
 from src.utils.logging_setup import get_logger
 
 logger = get_logger(__name__)
+
+
+def never_terminate(
+    prev_state: navix.states.State,
+    action: jax.Array,
+    state: navix.states.State,
+) -> jax.Array:
+    """Return False everywhere, so only truncation ends an episode.
+
+    Written here rather than taken from navix.terminations, whose
+    check_truncation takes (terminated, truncated) and cannot be used as a
+    termination function. The required signature is the one on_goal_reached
+    carries.
+
+    Removing a termination does not change the transition function, so the
+    agent still cannot occupy an obstacle's cell. Pinned by
+    tests/test_navix_env.py.
+
+    Args:
+        prev_state: Environment state before the action.
+        action: The action taken.
+        state: Environment state after the action.
+
+    Returns:
+        Scalar boolean array, always False, matching what navix's own
+        on_goal_reached returns.
+    """
+    del prev_state, action, state
+    return jnp.asarray(False, dtype=jnp.bool_)
 
 
 class NavixEnv:
@@ -26,8 +56,8 @@ class NavixEnv:
     the environment state, so `step()` takes the previous one directly.
     Batching over config.num_envs uses `jax.vmap`.
 
-    NAVIX auto-resets once max_steps is reached. Its own default is 100, so
-    max_steps is always passed explicitly.
+    NAVIX auto-resets once max_steps is reached, and its own default would
+    apply otherwise, so max_steps is always passed explicitly.
 
     Attributes:
         config: Environment configuration (name, num_envs, max_episode_steps).
@@ -43,8 +73,7 @@ class NavixEnv:
         Args:
             config: Environment configuration.
             observation_fn: NAVIX observation function selecting the view.
-                None keeps the library default, which is not `symbolic`, so
-                existing callers observe what they did before.
+                None keeps the library default, which is not `symbolic`.
 
                 Trajectory generation does not use this. Both observation modes
                 are derived from one rollout's state.
@@ -53,25 +82,35 @@ class NavixEnv:
                 grid matching no part of the per-cell contract.
         """
         self.config = config
-        # penality_coeff passed explicitly, not inherited from navix's 0.0
+        # penality_coeff passed explicitly, not inherited from navix's
         # default. observation_fn is passed only when given; navix.make's own
         # default is a real function that None would overwrite.
         observation_kwargs = (
             {} if observation_fn is None else {"observation_fn": observation_fn}
+        )
+        # Same reason as observation_fn: navix.make's own termination_fn is a
+        # real function, so the key is passed only when it is being replaced.
+        termination_kwargs = (
+            {"termination_fn": never_terminate}
+            if config.disable_early_termination
+            else {}
         )
         self.env = navix.make(
             config.name,
             max_steps=config.max_episode_steps,
             penality_coeff=config.penality_coeff,
             **observation_kwargs,
+            **termination_kwargs,
         )
         self._reset_fn = jax.jit(jax.vmap(self.env.reset))
         self._step_fn = jax.jit(jax.vmap(self.env.step))
         logger.info(
-            "NavixEnv initialised: name=%s num_envs=%d max_steps=%d",
+            "NavixEnv initialised: name=%s num_envs=%d max_steps=%d "
+            "early_termination=%s",
             config.name,
             config.num_envs,
             config.max_episode_steps,
+            not config.disable_early_termination,
         )
 
     def reset(self, rng: jax.Array) -> navix.environments.Timestep:
@@ -95,7 +134,8 @@ class NavixEnv:
         Args:
             timestep: Batched Timestep from reset() or a prior step. This is
                 the environment state.
-            action: Discrete actions, shape (num_envs,), each in [0, 7).
+            action: Discrete actions, shape (num_envs,), each a valid index
+                for the environment's action space.
 
         Returns:
             Next batched Timestep. NAVIX auto-resets once
@@ -109,9 +149,9 @@ class NavixEnv:
         """Derive an episode-end boolean from step_type.
 
         True whenever an episode has ended, for any reason. NAVIX's step_type
-        is 3-way. TRANSITION (0, ongoing), TRUNCATION (1, hit max_steps),
-        TERMINATION (2, an absorbing state). Use terminated() or truncated()
-        when the reason matters.
+        is 3-way. TRANSITION (ongoing), TRUNCATION (hit max_steps),
+        TERMINATION (an absorbing state). Use terminated() or truncated() when
+        the reason matters.
 
         Args:
             timestep: A Timestep from reset() or step().
