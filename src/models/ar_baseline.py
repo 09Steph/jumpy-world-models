@@ -16,9 +16,8 @@ reported gap therefore carries a train/test discretisation difference alongside
 the objective difference.
 """
 # pylint: disable=duplicate-code
-# The arms match arm 1 on encoder, backbone, decoder and parameter budget, so
-# every hyperparameter JumpyTransformer declares this declares too.
-# test_parameter_counts_match_between_arms asserts the duplication.
+# The arms match arm 1 on encoder, backbone, decoder and parameter budget.
+# test_parameter_counts_match_between_arms asserts it.
 
 import flax.linen as nn
 import jax
@@ -78,9 +77,9 @@ class AutoregressiveBaseline(nn.Module):
     Both arms share this class. What differs is the horizon distribution their
     training batches are drawn at, which belongs to the sampler.
 
-    The sequence is two positions, the state tokens and one action token. Arm 1
-    attends over ``1 + h`` tokens in one pass; this attends over ``1 + 1``,
-    ``h`` times.
+    The sequence is the state tokens followed by one action token. Arm 1
+    attends over the state tokens plus ``h`` action tokens in one pass; this
+    attends over the state tokens plus one, ``h`` times.
 
     Attributes:
         tokeniser: The seam, supplying state tokens and action tokens.
@@ -94,7 +93,8 @@ class AutoregressiveBaseline(nn.Module):
         activation: Activation name, resolved by layers.get_activation.
         norm_eps: RMSNorm epsilon.
         attention_window: Local attention half-width, or None for full
-            attention. At two positions every window is the full sequence.
+            attention. Under one-token state tokenisation the sequence is short
+            enough that any window covers it.
         remat_rollout: Recompute the scanned body on the backward pass instead
             of storing one set of activations per step. Numerically identical
             either way.
@@ -177,9 +177,8 @@ class AutoregressiveBaseline(nn.Module):
         raises ``InvalidRngError`` from inside the first ``RMSNorm``. Dropout is
         split per step.
 
-        A scan, not a Python loop. At ``horizon_max`` 100 and
-        ``num_layers`` 5 an unrolled loop would place 500 transformer blocks in
-        one graph.
+        A scan, not a Python loop. An unrolled loop would place
+        ``horizon_max`` times ``num_layers`` transformer blocks in one graph.
 
         Args:
             body: Callable `(module, carry, x) -> (carry, None)`.
@@ -210,7 +209,7 @@ class AutoregressiveBaseline(nn.Module):
         *,
         deterministic: bool,
     ) -> list[jax.Array]:
-        """Predict the endpoint through a LATENT rollout. The training path.
+        """Predict the endpoint through a latent rollout. The training path.
 
         Used by arm 2 at sampled ``h`` and by arm 3 at ``h = 1``. Nothing is
         discretised, so the state stays a token throughout and the decoder is
@@ -358,7 +357,8 @@ def ar_baseline_for_spec(
             and supplies the vocabularies.
         config: Model architecture settings.
         depth_extent: The environment's largest grid extent, driving encoder
-            depth only. Callers pass config.NAVIX_MAX_GRID_EXTENT for NAVIX.
+            depth only. Callers pass EnvConfig.max_grid_extent, which
+            resolve_observation_contract sets from the environment's row.
 
     Returns:
         The autoregressive comparator, unbound.

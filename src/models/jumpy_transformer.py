@@ -10,9 +10,8 @@ transformer over both. Attention is full and there is no causal mask.
 The horizon is the mask. Action sequences are padded to a fixed length and the
 count of unmasked action tokens is ``h``.
 
-The readout is the state token's output position, sliced by the length of
-whatever the tokeniser returned, so per-cell tokenisation changes no line
-here.
+The readout is the state tokens' output positions, sliced by the count the
+tokeniser returned.
 """
 from __future__ import annotations
 
@@ -33,8 +32,7 @@ from src.models.layers import get_activation
 from src.models.positional import RotaryPositionalEmbedding
 from src.data.window_sampler import WindowBatch
 
-# Flax's RNG stream name for dropout, named so a typo cannot create a second
-# stream.
+# Flax's RNG stream name for dropout.
 DROPOUT_RNG_NAME: str = "dropout"
 
 
@@ -57,8 +55,10 @@ def attention_mask(
             restricts attention to pairs at most that far apart.
 
     Returns:
-        Boolean mask of shape (batch, 1, seq, seq), True where a query may
-        attend to a key. The singleton axis broadcasts over attention heads.
+        Boolean mask broadcastable to (batch, 1, seq, seq), True where a
+        query may attend to a key. Full attention returns (batch, 1, 1, seq)
+        and relies on broadcasting over queries; a window materialises the full
+        (batch, 1, seq, seq). The head axis is singleton in both.
     """
     mask = valid_tokens[:, None, None, :]
     if window is None:
@@ -279,15 +279,16 @@ def jumpy_transformer_for_spec(
     The single construction site for the direct model.
 
     ``depth_extent`` reaches the encoder and nothing else. The spec decides what
-    is predicted, so the egocentric arm predicts a 7x7 grid while both arms
-    share one encoder depth.
+    is predicted, so the egocentric mode predicts a smaller grid while both
+    modes share one encoder depth.
 
     Args:
         spec: The observation being predicted. Sizes the decoder's output grid
             and supplies the vocabularies.
         config: Model architecture settings.
         depth_extent: The environment's largest grid extent, driving encoder
-            depth only. Callers pass config.NAVIX_MAX_GRID_EXTENT for NAVIX.
+            depth only. Callers pass EnvConfig.max_grid_extent, which
+            resolve_observation_contract sets from the environment's row.
 
     Returns:
         The direct transformer, unbound.
