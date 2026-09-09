@@ -13,7 +13,12 @@ import jax.numpy as jnp
 import navix
 
 from config import (
+    DEFAULT_STORED_OBSERVATION_MODES,
     OBS_CHANNEL_CLASSES_NAVIX,
+    OBS_VALUE_RANGE_RGB,
+    POLICY_UNIFORM_RANDOM,
+    REPRESENTATION_RGB,
+    REPRESENTATION_SYMBOLIC,
     EnvConfig,
 )
 from src.data.trajectory import (
@@ -28,10 +33,17 @@ from src.utils.logging_setup import get_logger
 
 logger = get_logger(__name__)
 
-# NAVIX observation functions per mode, both derived from the same state.
+# NAVIX observation functions per representation and mode, all derived from the
+# same state.
 NAVIX_OBSERVATION_FNS = {
-    ObservationMode.TOP_DOWN: navix.observations.symbolic,
-    ObservationMode.EGOCENTRIC: navix.observations.symbolic_first_person,
+    REPRESENTATION_SYMBOLIC: {
+        ObservationMode.TOP_DOWN: navix.observations.symbolic,
+        ObservationMode.EGOCENTRIC: navix.observations.symbolic_first_person,
+    },
+    REPRESENTATION_RGB: {
+        ObservationMode.TOP_DOWN: navix.observations.rgb,
+        ObservationMode.EGOCENTRIC: navix.observations.rgb_first_person,
+    },
 }
 
 # Name of the goal entity in a NAVIX state's entity dictionary.
@@ -41,16 +53,12 @@ NAVIX_GOAL_ENTITY: str = "goal"
 NAVIX_GRID_FIELD: str = "grid"
 
 # The generating policy recorded in every trajectory's provenance.
-UNIFORM_RANDOM_POLICY: str = "uniform_random"
+UNIFORM_RANDOM_POLICY: str = POLICY_UNIFORM_RANDOM
 
 
 @runtime_checkable
 class TrajectorySource(Protocol):
-    """A source of complete trajectories for offline training.
-
-    Implemented by NavixTrajectorySource, a live rollout of a uniform-random
-    policy, and by KatakombaTrajectorySource, which reads a recorded corpus.
-    """
+    """A source of complete trajectories for offline training."""
 
     def spec(self, mode: ObservationMode) -> ObservationSpec:
         """Describe this source's observations and action space for one mode.
@@ -76,27 +84,48 @@ class TrajectorySource(Protocol):
 class NavixTrajectorySource:
     """Rolls a uniform-random policy in NAVIX and emits complete episodes.
 
-    Both observation modes are recorded per episode from the same state, and
-    termination and truncation are kept as separate streams rather than one
+    The stored observation modes are recorded per episode from the same state,
+    and termination and truncation are kept as separate streams rather than one
     `done` flag. NAVIX auto-resets internally, so the observation at the
     boundary step is the endpoint of the episode that just ended. The fresh
     reset appears on the next step, where `timestep.t` returns to 0.
 
     Attributes:
         config: Environment configuration.
+        representation: Selects the observation functions and the field domain.
+        stored_modes: The observation modes recorded per episode.
         env: The underlying NAVIX adapter, built with num_envs forced to 1.
     """
 
-    def __init__(self, config: EnvConfig) -> None:
+    def __init__(
+        self,
+        config: EnvConfig,
+        *,
+        representation: str = REPRESENTATION_SYMBOLIC,
+        stored_modes: tuple[str, ...] | None = None,
+    ) -> None:
         """Build a single-environment NAVIX rollout source.
 
         Args:
             config: Environment configuration. num_envs is overridden to 1, so
                 the episode boundary is unambiguous.
+            representation: Symbolic or RGB, selecting the observation
+                functions and the field's declared domain.
+            stored_modes: Modes recorded per episode. None takes the
+                representation's default, which differs between
+                representations.
         """
         self.config = config
-        # replace() rather than a field-by-field rebuild, which silently drops
-        # any field the dataclass gains.
+        self.representation = representation
+        resolved = (
+            DEFAULT_STORED_OBSERVATION_MODES[representation]
+            if stored_modes is None
+            else stored_modes
+        )
+        self.stored_modes = tuple(ObservationMode(mode) for mode in resolved)
+        self.observation_fns = NAVIX_OBSERVATION_FNS[representation]
+        # A field-by-field rebuild would silently drop any field the dataclass
+        # gains.
         self.env = NavixEnv(replace(config, num_envs=1))
         logger.info(
             "NavixTrajectorySource ready: name=%s max_steps=%d policy=%s",
@@ -108,9 +137,6 @@ class NavixTrajectorySource:
     def spec(self, mode: ObservationMode) -> ObservationSpec:
         """Describe NAVIX's observations and action space for one mode.
 
-        The only place these constants become an ObservationSpec. `generate.py`
-        validates observations against them and `losses.py` reads them too.
-
         Args:
             mode: The observation mode being described.
 
@@ -120,13 +146,14 @@ class NavixTrajectorySource:
         """
         probe = self._observe(self.env.reset(jax.random.PRNGKey(0)), mode)
         grid_shape = tuple(int(dim) for dim in probe.shape[1:-1])
+        domain = (
+            {"value_range": OBS_VALUE_RANGE_RGB}
+            if self.representation == REPRESENTATION_RGB
+            else {"cardinality": tuple(OBS_CHANNEL_CLASSES_NAVIX)}
+        )
         return ObservationSpec(
             fields=(
-                FieldSpec(
-                    name=NAVIX_GRID_FIELD,
-                    shape=grid_shape,
-                    cardinality=tuple(OBS_CHANNEL_CLASSES_NAVIX),
-                ),
+                FieldSpec(name=NAVIX_GRID_FIELD, shape=grid_shape, **domain),
             ),
             num_actions=int(self.env.env.action_space.maximum) + 1,
         )
@@ -160,7 +187,7 @@ class NavixTrajectorySource:
         Returns:
             Observation array with the batch axis retained.
         """
-        return jax.vmap(NAVIX_OBSERVATION_FNS[mode])(timestep.state)
+        return jax.vmap(self.observation_fns[mode])(timestep.state)
 
     def _rollout_one(self, episode_key: jax.Array,
                      episode_index: int) -> Trajectory:
@@ -179,7 +206,7 @@ class NavixTrajectorySource:
         num_actions = int(self.env.env.action_space.maximum) + 1
 
         observations: dict[ObservationMode, list[jax.Array]] = {
-            mode: [self._observe(timestep, mode)[0]] for mode in ObservationMode
+            mode: [self._observe(timestep, mode)[0]] for mode in self.stored_modes
         }
         streams: dict[str, list[jax.Array]] = {
             name: []
@@ -210,7 +237,7 @@ class NavixTrajectorySource:
             streams["rewards"].append(timestep.reward[0])
             streams["terminated"].append(NavixEnv.terminated(timestep)[0])
             streams["truncated"].append(NavixEnv.truncated(timestep)[0])
-            for mode in ObservationMode:
+            for mode in self.stored_modes:
                 observations[mode].append(self._observe(timestep, mode)[0])
 
             if bool(NavixEnv.done(timestep)[0]):

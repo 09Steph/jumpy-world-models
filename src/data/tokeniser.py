@@ -23,11 +23,12 @@ from config import (
 from src.data.trajectory import ObservationSpec
 from src.models.decoder import (
     OneTokenGridDecoder,
+    OneTokenPixelDecoder,
     PerCellGridDecoder,
 )
 from src.models.encoder import encoder_for_spec
 
-# Smallest horizon a prediction may be made at. Enforced in this module.
+# Smallest horizon a prediction may be made at.
 MIN_HORIZON: int = 1
 
 
@@ -42,9 +43,8 @@ class StateTokens(Enum):
     expands that vector back to every cell."""
 
     PER_CELL = STATE_TOKENS_PER_CELL
-    """One token per grid cell. Sequence is (H*W) + h, with H and W read off
-    the ObservationSpec. The decoder is a shared head read off each cell's own
-    output position."""
+    """One token per grid cell. Sequence is (H*W) + h. The decoder is a shared
+    head read off each cell's own output position."""
 
     PATCH = STATE_TOKENS_PATCH
     """Cells grouped into blocks. Not implemented, see PATCH_TRIGGERS."""
@@ -59,17 +59,13 @@ PATCH_TRIGGERS: tuple[str, ...] = (
 
 
 class Tokeniser(Protocol):
-    """Turns an environment's observations and actions into model tokens.
-
-    The decoder is part of this Protocol.
-    """
+    """Turns an environment's observations and actions into model tokens."""
 
     def encode_state(self, observation: jax.Array) -> jax.Array:
         """Encode a batch of observations to (batch, num_tokens, d_model).
 
         num_tokens is 1 under ONE_TOKEN and H*W under PER_CELL. The token axis
-        is always present, so ONE_TOKEN returns (batch, 1, d_model) and not
-        (batch, d_model).
+        is present in both cases.
 
         Args:
             observation: Discrete observation codes, shape
@@ -83,11 +79,11 @@ class Tokeniser(Protocol):
         """Encode an action sequence to (batch, h, d_model) tokens.
 
         Args:
-            actions: Discrete action indices, shape (batch, h), padded to the
-                configured maximum horizon.
+            actions: Discrete action indices, shape (batch,
+                num_action_tokens), padded to that length.
 
         Returns:
-            Tokens of shape (batch, h, d_model).
+            Tokens of shape (batch, num_action_tokens, d_model).
         """
 
     def build_decoder(self) -> nn.Module:
@@ -95,18 +91,21 @@ class Tokeniser(Protocol):
 
         Returns:
             An unbound Flax module taking the transformer's state-token outputs
-            and returning one logits array per observation channel.
+            and returning one array per observation channel for a discrete
+            field, or a single array over all channels for a continuous one.
         """
 
 
 class GridTokeniser(nn.Module):
-    """Map discrete grid observations and action sequences to model tokens.
+    """Map grid observations and action sequences to model tokens.
 
-    Satisfies the `Tokeniser` Protocol. Single-field grid observations only.
+    Satisfies the `Tokeniser` Protocol. Single-field grid observations only,
+    discrete or continuous; the field's declared domain selects the encoder and
+    the decoder.
 
     The state encodes to one token by default and the actions to a learned
-    embedding per step, in one joint sequence padded to HORIZON_MAX. The
-    unmasked count from `action_padding_mask` is the horizon.
+    embedding per step, in one joint sequence. The unmasked count from
+    `action_padding_mask` is the horizon.
 
     Attributes:
         spec: Grid shape, per-channel cardinalities and action count. Must be
@@ -117,12 +116,11 @@ class GridTokeniser(nn.Module):
         depth_extent: The environment's largest grid extent, driving encoder
             depth.
         decoder_channels: Convolution widths of the decoder trunk.
-        state_tokens: How an observation becomes tokens. ONE_TOKEN by default.
+        state_tokens: How an observation becomes tokens.
+        num_observation_channels: Channels a continuous field predicts. Unused
+            by a discrete field, whose channel count comes from cardinality.
         activation: Activation name, resolved by layers.get_activation.
         norm_eps: RMSNorm epsilon.
-
-    Raises:
-        NotImplementedError: If state_tokens is PATCH.
     """
 
     spec: ObservationSpec
@@ -132,6 +130,7 @@ class GridTokeniser(nn.Module):
     decoder_channels: tuple[int, ...]
     depth_extent: int
     state_tokens: StateTokens = StateTokens.ONE_TOKEN
+    num_observation_channels: int = 0
     activation: str = "silu"
     norm_eps: float = 1e-4
 
@@ -152,12 +151,7 @@ class GridTokeniser(nn.Module):
         super().__post_init__()
 
     def setup(self) -> None:
-        """Build the observation encoder and the action embedding table.
-
-        The vocabularies come from the spec and the encoder's depth from
-        `depth_extent`. Uses `setup`; a compact method may only be one, and
-        this class exposes two encoding methods.
-        """
+        """Build the observation encoder and the action embedding table."""
         # pylint: disable=attribute-defined-outside-init
         self.encoder = encoder_for_spec(
             self.spec,
@@ -167,8 +161,6 @@ class GridTokeniser(nn.Module):
             pool_to_one_token=self.state_tokens is StateTokens.ONE_TOKEN,
             depth_extent=self.depth_extent,
         )
-        # A lookup, not a one-hot projection. The table is
-        # (num_actions, d_model) regardless of action-set size.
         self.action_embedding = nn.Embed(
             num_embeddings=self.spec.num_actions,
             features=self.d_model,
@@ -189,8 +181,8 @@ class GridTokeniser(nn.Module):
         """
         tokens = self.encoder(observation)
         if self.state_tokens is StateTokens.ONE_TOKEN:
-            # The encoder pools to (batch, d_model). The token axis is
-            # restored here so the encoder keeps one shape per pooling mode.
+            # The encoder pools to (batch, d_model); the token axis is restored
+            # here.
             return tokens[:, None, :]
         return tokens
 
@@ -212,16 +204,32 @@ class GridTokeniser(nn.Module):
     def build_decoder(self) -> nn.Module:
         """Return the decoder matching this tokenisation.
 
-        Both decoders take different readout shapes and return the same
-        per-channel logits shape. `nn.nowrap`: this constructs a module and
-        does not use one.
+        `nn.nowrap`: this constructs a module and does not use one.
 
         Returns:
             An unbound decoder module taking the transformer's state-token
             outputs, shape (batch, num_tokens, d_model).
+
+        Raises:
+            NotImplementedError: If a continuous field is paired with per-cell
+                tokenisation, which has no matching decoder.
         """
         field = self.spec.single_field()
         height, width = field.shape
+        if field.value_range is not None:
+            if self.state_tokens is not StateTokens.ONE_TOKEN:
+                raise NotImplementedError(
+                    f"{self.state_tokens.value} tokenisation has no continuous "
+                    f"decoder. Field {field.name!r} declares a value_range, "
+                    "which pairs with ONE_TOKEN only."
+                )
+            return OneTokenPixelDecoder(
+                obs_grid_shape=(height, width),
+                num_channels=self.num_observation_channels,
+                channels=self.decoder_channels,
+                activation=self.activation,
+                norm_eps=self.norm_eps,
+            )
         if self.state_tokens is StateTokens.ONE_TOKEN:
             return OneTokenGridDecoder(
                 obs_grid_shape=(height, width),
@@ -244,15 +252,12 @@ def tokeniser_for_spec(
 ) -> GridTokeniser:
     """Build the grid tokeniser an environment and a model config imply.
 
-    Resolves the configured tokenisation name to the enum, so an unknown string
-    fails here with the valid options listed.
-
     Args:
         spec: The observation being predicted. Supplies the vocabularies and
             the decoder's output grid.
         config: Model architecture settings supplying the widths.
         depth_extent: The environment's largest grid extent, driving encoder
-            depth only. Required and keyword-only.
+            depth.
 
     Returns:
         A GridTokeniser sized to the spec at the requested depth.
@@ -277,6 +282,7 @@ def tokeniser_for_spec(
         decoder_channels=config.decoder_channels,
         depth_extent=depth_extent,
         state_tokens=state_tokens,
+        num_observation_channels=config.obs_channels,
         activation=config.activation,
         norm_eps=config.norm_eps,
     )
@@ -307,8 +313,7 @@ def action_padding_mask(
 def check_horizons_valid(horizons: jax.Array, num_action_tokens: int) -> None:
     """Raise if any horizon is outside [MIN_HORIZON, num_action_tokens].
 
-    A host-side check on a sampled batch, not part of the forward pass. It
-    costs one host sync per call. Callers run it when a batch is built.
+    A host-side check on a sampled batch, not part of the forward pass.
 
     Args:
         horizons: True horizon per example, shape (batch,).

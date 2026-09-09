@@ -2,7 +2,7 @@
 
 Storage is HDF5 on Minari's per-episode schema. `terminated` and `truncated`
 map to `terminations` and `truncations` on the way out and back on the way in.
-Both observation modes for one trajectory share an episode group.
+The stored observation modes for one trajectory share an episode group.
 """
 
 from __future__ import annotations
@@ -32,9 +32,15 @@ TERMINATIONS_DATASET: str = "terminations"
 TRUNCATIONS_DATASET: str = "truncations"
 GOAL_POSITION_DATASET: str = "goal_position"
 EXECUTED_ACTIONS_DATASET: str = "executed_actions"
+STATE_GROUP: str = "state"
 PROVENANCE_ATTR: str = "provenance_json"
 SCHEMA_ATTR: str = "schema"
-SCHEMA_NAME: str = "minari-like/v2"
+SCHEMA_NAME: str = "minari-like/v3"
+
+# The one state leaf held once per shard rather than per episode. It is the
+# sprite atlas.
+RENDERING_CACHE_LEAF: str = "cache.patches"
+RENDERING_CACHE_DATASET: str = "rendering_cache"
 
 # Per-episode datasets, in the order they are written.
 FLAG_FIELDS: tuple[tuple[str, str], ...] = (
@@ -52,7 +58,7 @@ BACKFILLED_FIELD: tuple[str, str] = (EXECUTED_ACTIONS_DATASET, ACTIONS_DATASET)
 
 
 class TrajectoryStore:
-    """Write and read complete trajectories in both observation modes.
+    """Write and read complete trajectories in every stored observation mode.
 
     One file per shard. The round trip preserves dtypes. Observations are
     uint8, and a read path promoting them to int64 quadruples the dataset on
@@ -71,17 +77,53 @@ class TrajectoryStore:
             trajectories: Episodes to write. May be empty, which writes a valid
                 shard carrying zero episode groups.
             path: Destination file. Parent directories are created.
-            compression: gzip level, or None to store uncompressed. Off by
-                default, so an existing shard is written byte for byte as
-                before.
+            compression: gzip level, or None to store uncompressed.
         """
         ensure_dir(path.parent)
         with h5py.File(path, "w") as handle:
             handle.attrs[SCHEMA_ATTR] = SCHEMA_NAME
+            self._write_rendering_cache(handle, trajectories, compression)
             for index, trajectory in enumerate(trajectories):
                 self._write_episode(handle, index, trajectory, compression)
         logger.info(
             "wrote %d trajectories -> %s", len(trajectories), safe_rel(path)
+        )
+
+    @staticmethod
+    def _write_rendering_cache(
+        handle: h5py.File,
+        trajectories: Sequence[Trajectory],
+        compression: int | None,
+    ) -> None:
+        """Write the sprite atlas once for the whole shard.
+
+        Args:
+            handle: Open HDF5 file.
+            trajectories: Episodes about to be written.
+            compression: gzip level, or None to store uncompressed.
+
+        Raises:
+            ValueError: If two episodes carry different atlases.
+        """
+        atlases = [
+            trajectory.state[RENDERING_CACHE_LEAF]
+            for trajectory in trajectories
+            if trajectory.state is not None
+            and RENDERING_CACHE_LEAF in trajectory.state
+        ]
+        if not atlases:
+            return
+        first = np.asarray(atlases[0])
+        for other in atlases[1:]:
+            if not np.array_equal(first, np.asarray(other)):
+                raise ValueError(
+                    "episodes in one shard carry different rendering caches, "
+                    "so a single shard-level atlas cannot represent them. The "
+                    "shard would render some episodes against another's "
+                    "sprites."
+                )
+        TrajectoryStore._create(
+            handle, RENDERING_CACHE_DATASET, first, compression
         )
 
     @staticmethod
@@ -113,6 +155,15 @@ class TrajectoryStore:
                 np.asarray(getattr(trajectory, field_name)),
                 compression,
             )
+        if trajectory.state is None:
+            return
+        state = group.create_group(STATE_GROUP)
+        for leaf, values in trajectory.state.items():
+            if leaf == RENDERING_CACHE_LEAF:
+                continue
+            TrajectoryStore._create(
+                state, leaf, np.asarray(values), compression
+            )
 
     @staticmethod
     def _create(
@@ -120,8 +171,7 @@ class TrajectoryStore:
     ) -> None:
         """Create one dataset, compressed where compression is possible.
 
-        gzip requires chunked storage and an empty dataset cannot be chunked,
-        so a zero-sized field is written uncompressed whatever the level.
+        A zero-sized field is written uncompressed whatever the level.
 
         Args:
             group: Destination group.
@@ -180,17 +230,27 @@ class TrajectoryStore:
             The episodes it holds, in write order, as numpy arrays.
         """
         with h5py.File(path, "r") as handle:
+            atlas = (
+                handle[RENDERING_CACHE_DATASET][()]
+                if RENDERING_CACHE_DATASET in handle
+                else None
+            )
             return [
-                self._read_episode(handle[name])
+                self._read_episode(handle[name], atlas)
                 for name in sorted(handle.keys())
+                if isinstance(handle[name], h5py.Group)
             ]
 
     @staticmethod
-    def _read_episode(group: h5py.Group) -> Trajectory:
+    def _read_episode(
+        group: h5py.Group, atlas: np.ndarray | None = None
+    ) -> Trajectory:
         """Rebuild one Trajectory from its episode group.
 
         Args:
             group: The episode group.
+            atlas: The shard's sprite atlas, restored into the state mapping by
+                reference so one copy serves every episode in the shard.
         """
         observations = {
             ObservationMode(name): group[OBSERVATIONS_GROUP][name][()]
@@ -203,8 +263,30 @@ class TrajectoryStore:
         return Trajectory(
             observations=observations,
             provenance=json.loads(group.attrs[PROVENANCE_ATTR]),
+            state=TrajectoryStore._read_state(group, atlas),
             **fields,
         )
+
+    @staticmethod
+    def _read_state(
+        group: h5py.Group, atlas: np.ndarray | None
+    ) -> dict[str, np.ndarray] | None:
+        """Read an episode's stored state, or None where it holds none.
+
+        Args:
+            group: The episode group.
+            atlas: The shard's sprite atlas, or None.
+
+        Returns:
+            Leaf name to array, the atlas included when the shard carries one,
+            or None for a shard predating stored state.
+        """
+        if STATE_GROUP not in group:
+            return None
+        state = {name: group[STATE_GROUP][name][()] for name in group[STATE_GROUP]}
+        if atlas is not None:
+            state[RENDERING_CACHE_LEAF] = atlas
+        return state
 
     @staticmethod
     def _read_field(group: h5py.Group, dataset_name: str) -> np.ndarray:
@@ -269,8 +351,8 @@ class TrajectoryStore:
         Measured over all valid (t, t+h) pairs within each trajectory rather
         than over the evaluation windows, so these describe the generated data
         and not the baseline the model was scored against. No copy-baseline
-        cross-entropy is computed here. It lives with the baseline in
-        `src/eval/baselines.py`, which owns the smoothing convention.
+        cross-entropy is computed here; it lives in `src/eval/baselines.py`,
+        which owns the smoothing convention.
 
         Args:
             trajectories: Episodes to measure.
