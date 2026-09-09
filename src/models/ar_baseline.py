@@ -11,13 +11,17 @@ on architecture by construction.
 
 ``rollout_tokens`` runs in token space, never discretises, and is the
 differentiable training path. ``rollout_observations`` decodes, argmaxes and
-re-encodes at every step, and is the evaluation path for both arms. Arm 2's
-reported gap therefore carries a train/test discretisation difference alongside
-the objective difference.
+re-encodes at every step, and is the evaluation path for a discrete field. Arm
+2's reported gap therefore carries a train/test discretisation difference
+alongside the objective difference.
+
+``rollout_values`` is the evaluation path for a continuous field. It decodes and
+re-encodes the same way and takes no argmax. ``__call__`` selects between the
+two on the field's declared domain, so the discretisation difference above is a
+property of the discrete path alone.
 """
 # pylint: disable=duplicate-code
 # The arms match arm 1 on encoder, backbone, decoder and parameter budget.
-# test_parameter_counts_match_between_arms asserts it.
 
 import flax.linen as nn
 import jax
@@ -59,8 +63,7 @@ def objective_for_arm(arm: int) -> str:
         OBJECTIVE_ENDPOINT or OBJECTIVE_ONE_STEP.
 
     Raises:
-        KeyError: If the arm is not one this module builds. Arm 1 is
-            ``jumpy_transformer``'s.
+        KeyError: If the arm is not one this module builds.
     """
     if arm not in OBJECTIVE_BY_ARM:
         raise KeyError(
@@ -96,8 +99,8 @@ class AutoregressiveBaseline(nn.Module):
             attention. Under one-token state tokenisation the sequence is short
             enough that any window covers it.
         remat_rollout: Recompute the scanned body on the backward pass instead
-            of storing one set of activations per step. Numerically identical
-            either way.
+            of storing one set of activations per step. The forward pass is
+            bit-identical either way; the gradient may differ in fusion.
     """
 
     tokeniser: nn.Module
@@ -113,11 +116,7 @@ class AutoregressiveBaseline(nn.Module):
     remat_rollout: bool = False
 
     def setup(self) -> None:
-        """Build the shared single-step backbone.
-
-        Submodules are assigned here. A compact method may only be one, and
-        this class exposes several.
-        """
+        """Build the shared single-step backbone."""
         # pylint: disable=attribute-defined-outside-init
         self.blocks = [
             TransformerBlock(
@@ -164,21 +163,14 @@ class AutoregressiveBaseline(nn.Module):
         for block in self.blocks:
             tokens = block(tokens, mask, deterministic=deterministic)
         tokens = self.output_norm(tokens)
-        # Sliced by count, so per-cell tokenisation changes the sequence
-        # length and no line here.
+        # Sliced by count, so per-cell tokenisation needs no change here.
         return tokens[:, :num_state_tokens, :]
 
     def _scan(self, body, carry, xs, length: int):
         """Run a rollout body over the action axis with parameters shared.
 
-        One core is applied at every step, so its parameters are broadcast
-        and not stacked. ``variable_broadcast="params"`` with
-        ``split_rngs={"params": False}`` is required; without it initialisation
-        raises ``InvalidRngError`` from inside the first ``RMSNorm``. Dropout is
-        split per step.
-
-        A scan, not a Python loop. An unrolled loop would place
-        ``horizon_max`` times ``num_layers`` transformer blocks in one graph.
+        One core is applied at every step, so its parameters are broadcast and
+        not stacked. Dropout is split per step.
 
         Args:
             body: Callable `(module, carry, x) -> (carry, None)`.
@@ -310,6 +302,67 @@ class AutoregressiveBaseline(nn.Module):
         )
         return self.decoder(tokens)
 
+    def rollout_values(
+        self,
+        observation: jax.Array,
+        actions: jax.Array,
+        horizons: jax.Array,
+        *,
+        deterministic: bool,
+    ) -> list[jax.Array]:
+        """Predict the endpoint by rolling out on the model's own values.
+
+        The continuous counterpart to ``rollout_observations``. Nothing is
+        discretised: a continuous field has no class axis, so there is no class
+        to commit to and the decoded values feed back as the next observation.
+
+        The decoded values are returned to the stored scale before they feed
+        back. The encoder normalises whatever it is given and the decoder emits
+        already normalised, so feeding its output back unscaled divides by the
+        range a second time and collapses the rollout.
+
+        Args:
+            observation: Stored observation values at time t,
+                (batch, height, width, num_channels).
+            actions: Discrete action indices padded to the model's maximum
+                horizon, (batch, num_action_tokens).
+            horizons: True horizon per example, (batch,).
+            deterministic: True to disable dropout.
+
+        Returns:
+            One array, the predicted values on the decoder's normalised scale.
+        """
+        low, high = self.tokeniser.spec.single_field().value_range
+        current = observation.astype(jnp.float32)
+        action_tokens = self.tokeniser.encode_actions(actions)
+
+        def body(module, carry, action_token):
+            observed, tokens, index = carry
+            stepped = module.step(
+                module.tokeniser.encode_state(observed),
+                action_token,
+                deterministic=deterministic,
+            )
+            predicted = module.decoder(stepped)[0] * (high - low) + low
+            active = index < horizons
+            return (
+                jnp.where(active[:, None, None, None], predicted, observed),
+                jnp.where(active[:, None, None], stepped, tokens),
+                index + 1,
+            ), None
+
+        _, tokens, _ = self._scan(
+            body,
+            (
+                current,
+                self.tokeniser.encode_state(current),
+                jnp.zeros(horizons.shape, jnp.int32),
+            ),
+            jnp.swapaxes(action_tokens, 0, 1),
+            actions.shape[1],
+        )
+        return self.decoder(tokens)
+
     def __call__(
         self,
         observation: jax.Array,
@@ -320,22 +373,31 @@ class AutoregressiveBaseline(nn.Module):
     ) -> list[jax.Array]:
         """Predict the endpoint the way this arm is scored.
 
-        The discretising rollout. Arm 1's ``__call__`` is one forward pass,
-        arms 2 and 3's is ``h`` steps on their own argmax, so
-        ``predict_endpoint`` needs no branch on the arm.
+        Arm 1's ``__call__`` is one forward pass, arms 2 and 3's is ``h`` steps
+        on their own output, so ``predict_endpoint`` needs no branch on the arm.
+        What the step commits to follows the field: a discrete one commits to a
+        class through ``rollout_observations``, a continuous one carries its
+        values through ``rollout_values``.
+
+        The branch reads ``value_range`` rather than a representation name.
 
         The training path is not reachable from here. Arm 2's loss calls
         ``rollout_tokens`` by name.
 
         Args:
-            observation: Discrete observation codes at time t.
+            observation: Stored observation values at time t.
             actions: Discrete action indices, padded.
             horizons: True horizon per example.
             deterministic: True to disable dropout.
 
         Returns:
-            One logits array per observation channel.
+            One logits array per channel on a discrete field, one array of
+            values on a continuous one.
         """
+        if self.tokeniser.spec.single_field().value_range is not None:
+            return self.rollout_values(
+                observation, actions, horizons, deterministic=deterministic
+            )
         return self.rollout_observations(
             observation, actions, horizons, deterministic=deterministic
         )
@@ -357,8 +419,7 @@ def ar_baseline_for_spec(
             and supplies the vocabularies.
         config: Model architecture settings.
         depth_extent: The environment's largest grid extent, driving encoder
-            depth only. Callers pass EnvConfig.max_grid_extent, which
-            resolve_observation_contract sets from the environment's row.
+            depth.
 
     Returns:
         The autoregressive comparator, unbound.
