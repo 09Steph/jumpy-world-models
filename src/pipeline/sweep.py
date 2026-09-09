@@ -40,20 +40,34 @@ from src.pipeline.aggregate_stats import (
     aggregate_scalar,
 )
 from src.pipeline.metrics_schema import (
-    COPY_CE_KEY,
-    MODEL_CE_KEY,
+    ERROR_METRIC_CROSS_ENTROPY,
+    ERROR_METRIC_KEY,
     PER_HORIZON_KEY,
     SKILL_SCORE_KEY,
+    copy_error_key,
+    model_error_key,
 )
 from src.utils.logging_setup import get_logger
 from src.utils.paths import safe_rel
 
 logger = get_logger(__name__)
 
-# The error the ratio and the horizon axis are read on. The fit runs on
-# held-out cross-entropy, so the sweep carries that metric and the skill score
-# that normalises it.
-SWEEP_METRICS: tuple[str, ...] = (MODEL_CE_KEY, SKILL_SCORE_KEY)
+def sweep_metrics(error_metric: str) -> tuple[str, ...]:
+    """Return the per-horizon metrics the sweep carries for one error metric.
+
+    The error the ratio and the horizon axis are read on, resolved from the
+    metric the aggregates declare. The fit reads the model series under
+    whichever key that metric writes to, so naming one here would carry
+    cross-entropy onto a run that never scored it.
+
+    Args:
+        error_metric: The value the aggregates declare under ERROR_METRIC_KEY.
+
+    Returns:
+        The model error key and the skill score that normalises it.
+    """
+    return (model_error_key(error_metric), SKILL_SCORE_KEY)
+
 
 RATIO_KEY: str = "endpoint_error_ratio"
 
@@ -128,6 +142,9 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             BOOTSTRAP_SEED if statistic_seed is None else statistic_seed
         )
         self.flags: list[str] = []
+        # Overwritten in sweep() from what the aggregates declare. Defaulted so
+        # every key selection has a value before an aggregate is read.
+        self.error_metric: str = ERROR_METRIC_CROSS_ENTROPY
 
     # -- paths ---------------------------------------------------------------
 
@@ -226,14 +243,43 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             loaded[arm] = json.loads(path.read_text(encoding="utf-8"))
         return loaded
 
+    def _declared_error_metric(self, loaded: dict[int, dict]) -> str:
+        """Return the error metric the loaded aggregates declare.
+
+        An aggregate written before the field existed carries cross-entropy by
+        construction: it is the only metric this codebase scored then.
+
+        Args:
+            loaded: {arm: aggregate payload} for the arms present.
+
+        Returns:
+            The declared metric.
+
+        Raises:
+            ValueError: If the arms disagree. Arms scored under different
+                metrics cannot share a horizon axis or a ratio.
+        """
+        declared = {
+            payload.get(ERROR_METRIC_KEY, ERROR_METRIC_CROSS_ENTROPY)
+            for payload in loaded.values()
+        }
+        if len(declared) > 1:
+            raise ValueError(
+                f"arms of run '{self.run_name}' disagree about "
+                f"{ERROR_METRIC_KEY}: {sorted(declared)}. They were scored "
+                f"under different error metrics, so no cross-arm curve or "
+                f"ratio over them is readable."
+            )
+        return declared.pop()
+
     # -- assembly ------------------------------------------------------------
 
     def _provenance(self, arm: int, mode_block: dict) -> dict:
         """Return one arm's provenance for one mode.
 
-        The parameter selection is read per mode, not per arm: one arm's two
-        modes can be scored under different selections when only one of them
-        has been re-scored.
+        The parameter selection is read per mode, not per arm: an arm's modes
+        can be scored under different selections when only one of them has
+        been re-scored.
 
         Args:
             arm: The arm being described.
@@ -323,8 +369,9 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         per_horizon = mode_block.get(PER_HORIZON_KEY, {})
         if low not in per_horizon or high not in per_horizon:
             return None
-        numerator = (per_horizon[high].get(MODEL_CE_KEY) or {}).get("values")
-        denominator = (per_horizon[low].get(MODEL_CE_KEY) or {}).get("values")
+        model_key = model_error_key(self.error_metric)
+        numerator = (per_horizon[high].get(model_key) or {}).get("values")
+        denominator = (per_horizon[low].get(model_key) or {}).get("values")
         if not numerator or not denominator:
             return None
         if len(numerator) != len(denominator):
@@ -349,7 +396,7 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         )
         block["numerator_horizon"] = high
         block["denominator_horizon"] = low
-        block["metric"] = MODEL_CE_KEY
+        block["metric"] = model_error_key(self.error_metric)
         return block
 
     def _horizon_entry(self, mode: str, horizon: str, arms: dict[int, dict]) -> dict:
@@ -374,11 +421,13 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             if block is None:
                 continue
             entry["arms"][str(arm)] = {
-                metric: block.get(metric) for metric in SWEEP_METRICS
+                metric: block.get(metric)
+                for metric in sweep_metrics(self.error_metric)
             }
             if source_arm is None:
                 source_arm = arm
-                entry[COPY_CE_KEY] = block.get(COPY_CE_KEY)
+                copy_key = copy_error_key(self.error_metric)
+                entry[copy_key] = block.get(copy_key)
                 entry[WINDOWS_RANGE_KEY] = block.get(WINDOWS_RANGE_KEY)
                 continue
             self._check_shared_field(mode, horizon, arm, source_arm, block, entry)
@@ -408,7 +457,7 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             block: That arm's per-horizon block.
             entry: The horizon entry holding the carried values.
         """
-        for field in (COPY_CE_KEY, WINDOWS_RANGE_KEY):
+        for field in (copy_error_key(self.error_metric), WINDOWS_RANGE_KEY):
             if block.get(field) != entry.get(field):
                 message = (
                     f"arm {arm} disagrees with arm {source_arm} about {field} "
@@ -488,12 +537,17 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
                 f"{safe_rel(self.series_dir(ARMS[0]))} -- aggregate at least "
                 f"one arm before sweeping."
             )
+        self.error_metric = self._declared_error_metric(loaded)
         by_arm_mode = {
             arm: payload.get("by_mode", {}) for arm, payload in loaded.items()
         }
         modes = sorted({mode for blocks in by_arm_mode.values() for mode in blocks})
         return {
             "run_name": self.run_name,
+            # Carried from the aggregates so the fit resolves its own key from
+            # one declaration rather than inferring the metric from which keys
+            # the artefact happens to hold.
+            ERROR_METRIC_KEY: self.error_metric,
             "arm_runs": {str(arm): self.arm_run(arm) for arm in sorted(loaded)},
             "arms_present": [str(arm) for arm in sorted(loaded)],
             "arms_absent": [str(arm) for arm in ARMS if arm not in loaded],

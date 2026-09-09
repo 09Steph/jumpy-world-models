@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 from config import (
     CONFIG_DIGEST_LENGTH,
     MANIFEST_SCHEMA_VERSION,
-    OBS_MODES,
     SEEDS,
     SPLIT_PROVENANCE_FILENAME,
     ExperimentConfig,
@@ -93,9 +92,10 @@ def _entry(config: ExperimentConfig, observation_mode: str, data_seed: int) -> d
 def build_manifest(config: ExperimentConfig) -> dict:
     """Build the derived manifest for one run in one environment.
 
-    Reports every observation mode and every reporting seed regardless of what
-    this invocation ran. OBS_MODES is not per environment, so an environment
-    with one meaningful mode carries entries that can never reach `done`.
+    Reports every stored observation mode and every reporting seed regardless
+    of what this invocation ran. The stored set comes from the run's
+    representation, so a run that writes one mode does not list entries for
+    data it never produced.
 
     Returns:
         The manifest as a JSON-serialisable mapping.
@@ -108,7 +108,7 @@ def build_manifest(config: ExperimentConfig) -> dict:
         "config_digest": config_digest(config),
         "entries": [
             _entry(config, observation_mode, data_seed)
-            for observation_mode in OBS_MODES
+            for observation_mode in config.data.modes_stored()
             for data_seed in SEEDS
         ],
     }

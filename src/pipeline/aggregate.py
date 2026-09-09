@@ -42,13 +42,15 @@ from src.pipeline.aggregate_stats import (
     sample_std,
 )
 from src.pipeline.metrics_schema import (
-    COPY_CE_KEY,
-    MODEL_CE_KEY,
+    ERROR_METRIC_CROSS_ENTROPY,
+    ERROR_METRIC_KEY,
     PER_HORIZON_FINAL_STEP_KEY,
     PER_HORIZON_GAP_KEY,
     PER_HORIZON_KEY,
     SKILL_SCORE_KEY,
     WINDOWS_KEY,
+    copy_error_key,
+    model_error_key,
 )
 from src.utils.logging_setup import get_logger
 from src.utils.paths import safe_rel
@@ -62,17 +64,27 @@ AGGREGATE_TEMPLATE: str = "aggregate_arm{arm}.json"
 
 AGGREGATE_FILENAME: str = AGGREGATE_TEMPLATE.format(arm=ARM_DIRECT)
 
-# Keys that must appear in every per-horizon block. Imported from
-# metrics_schema rather than restated, so a rename there breaks this import
-# instead of producing an empty series. The rest of the block's metrics are
-# discovered, so adding one to the writer needs no edit here and removing one
-# fails loudly.
-REQUIRED_PER_HORIZON_KEYS: tuple[str, ...] = (
-    MODEL_CE_KEY,
-    COPY_CE_KEY,
-    SKILL_SCORE_KEY,
-    WINDOWS_KEY,
-)
+def required_per_horizon_keys(error_metric: str) -> tuple[str, ...]:
+    """Return the per-horizon keys a run under one metric must carry.
+
+    Resolved from the metric the artefact declares, so a rename in
+    metrics_schema breaks this import rather than producing an empty series,
+    and a run scored under one metric is never required to carry the other's
+    key. The rest of the block's metrics are discovered, so adding one to the
+    writer needs no edit here and removing one fails loudly.
+
+    Args:
+        error_metric: The value the artefact declares under ERROR_METRIC_KEY.
+
+    Returns:
+        The required keys for that metric.
+    """
+    return (
+        model_error_key(error_metric),
+        copy_error_key(error_metric),
+        SKILL_SCORE_KEY,
+        WINDOWS_KEY,
+    )
 
 # Written into every mode's block so a reader can see the check ran. Non-empty
 # is a refusal, not a report.
@@ -202,8 +214,8 @@ def infer_run_name(series_dir: Path) -> str:
 class CrossSeedAggregator:
     """Combine one run's per-seed artefacts into a reportable aggregate.
 
-    Reads, never writes, the per-seed artefacts. Runs once per run_name, after
-    every seed has completed.
+    Reads, never writes, the per-seed artefacts. Runs once per run name and
+    arm, after every seed has completed.
 
     Refuses to aggregate a truncated seed. A run killed mid-training leaves a
     complete-looking artefact set behind, so ``completed_steps`` and
@@ -376,6 +388,36 @@ class CrossSeedAggregator:
         )
 
     # -- loading and validation ----------------------------------------------
+
+    def _declared_error_metric(self, records: Sequence[dict]) -> str:
+        """Return the error metric this mode's seeds were scored under.
+
+        Read from the artefacts rather than from a config, because it is the
+        scoring run that declares it. An artefact written before the field
+        existed carries cross-entropy by construction: it is the only metric
+        this codebase scored then.
+
+        Args:
+            records: The loaded per-seed records for one mode.
+
+        Returns:
+            The declared metric.
+
+        Raises:
+            SeriesIncompleteError: If the seeds disagree, which means they were
+                scored under different metrics and cannot be pooled.
+        """
+        declared = {
+            record["metrics"].get(ERROR_METRIC_KEY, ERROR_METRIC_CROSS_ENTROPY)
+            for record in records
+        }
+        if len(declared) > 1:
+            raise SeriesIncompleteError(
+                f"seeds of run '{self.run_name}' disagree about "
+                f"{ERROR_METRIC_KEY}: {sorted(declared)}. They were scored "
+                f"under different error metrics and cannot be pooled."
+            )
+        return declared.pop()
 
     def _load_seed_artefacts(
         self, mode: str, allow_partial: bool = False
@@ -619,7 +661,7 @@ class CrossSeedAggregator:
 
         Raises:
             SeriesIncompleteError: If the seeds disagree on the horizon grid,
-                if a REQUIRED_PER_HORIZON_KEYS entry is absent, or if a metric
+                if a required_per_horizon_keys entry is absent, or if a metric
                 outside SAMPLING_NULLABLE_METRICS is undefined on some seeds
                 but not all.
         """
@@ -659,9 +701,10 @@ class CrossSeedAggregator:
         }
         first = blocks[records[0]["seed"]]
         if counts_windows:
-            missing = [
-                key for key in REQUIRED_PER_HORIZON_KEYS if key not in first
-            ]
+            required = required_per_horizon_keys(
+                self._declared_error_metric(records)
+            )
+            missing = [key for key in required if key not in first]
             if missing:
                 raise SeriesIncompleteError(
                     f"run '{self.run_name}' is missing {missing} at horizon "
@@ -795,7 +838,6 @@ class CrossSeedAggregator:
 
     # -- policy --------------------------------------------------------------
 
-    # Inert. Removing it is a separate cleanup.
     def _aggregate_policy(self, records: Sequence[dict]) -> dict | None:
         """Aggregate task-success metrics for both action rules.
 
@@ -803,7 +845,7 @@ class CrossSeedAggregator:
         the artefact's own field, never hardcoded.
 
         Stale: nothing writes a policy artefact, so this returns None on every
-        current run.
+        current run. Removing it is a separate cleanup.
 
         Args:
             records: The loaded per-seed records.
@@ -865,8 +907,6 @@ class CrossSeedAggregator:
 
     # -- curves --------------------------------------------------------------
 
-    # Inert. Nothing under src/ writes `training_loss_curve` or
-    # `held_out_curve`, so this returns empty lists on every current run.
     def _aggregate_curves(self, records: Sequence[dict]) -> dict:
         """Aggregate the held-out fidelity curve and the loss series.
 
@@ -1063,6 +1103,9 @@ class CrossSeedAggregator:
                 for record in records
             },
             "config": records[0]["metrics"].get("config"),
+            # Carried, not recomputed. The evaluate stage declares it and every
+            # reader downstream resolves its keys from this one value.
+            ERROR_METRIC_KEY: self._declared_error_metric(records),
             "statistic": {
                 "iqm_reps": self.reps,
                 "iqm_seed": self.statistic_seed,

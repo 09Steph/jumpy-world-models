@@ -43,7 +43,12 @@ from src.pipeline.aggregate_stats import (
     CONFIDENCE_INTERVAL_SIZE,
     aggregate_scalar,
 )
-from src.pipeline.metrics_schema import MODEL_CE_KEY, SKILL_SCORE_KEY
+from src.pipeline.metrics_schema import (
+    ERROR_METRIC_CROSS_ENTROPY,
+    ERROR_METRIC_KEY,
+    SKILL_SCORE_KEY,
+    model_error_key,
+)
 from src.pipeline.sweep import RATIO_KEY, sorted_horizons
 from src.utils.logging_setup import get_logger
 from src.utils.paths import safe_rel
@@ -384,8 +389,8 @@ def log_log_slope(
     that the exponent does not depend on that choice.
 
     Errors must be strictly positive; a non-positive value returns an
-    unidentified result rather than raising, because a cross-entropy of zero
-    is a legitimate artefact value and not a caller error.
+    unidentified result rather than raising, because a zero error is a
+    legitimate artefact value and not a caller error.
 
     Args:
         horizons: The evaluation horizons, ascending.
@@ -540,6 +545,7 @@ class HorizonFit:
         self.reps = BOOTSTRAP_REPS if reps is None else reps
         self.statistic_seed = BOOTSTRAP_SEED if statistic_seed is None else statistic_seed
         self.flags: list[str] = []
+        self.error_metric: str = ERROR_METRIC_CROSS_ENTROPY
 
     def source_path(self) -> Path:
         """Return where the sweep artefact is expected."""
@@ -566,6 +572,29 @@ class HorizonFit:
             )
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _declared_error_metric(self, sweep: dict) -> str:
+        """Return the error metric the sweep declares.
+
+        An artefact written before the field existed carries cross-entropy by
+        construction, because it is the only metric this codebase scored then.
+
+        Args:
+            sweep: The sweep artefact.
+
+        Returns:
+            The declared metric.
+        """
+        declared = sweep.get(ERROR_METRIC_KEY)
+        if declared is None:
+            logger.info(
+                "%s declares no %s, reading it as %s",
+                safe_rel(self.source_path()),
+                ERROR_METRIC_KEY,
+                ERROR_METRIC_CROSS_ENTROPY,
+            )
+            return ERROR_METRIC_CROSS_ENTROPY
+        return declared
+
     def _curves(self, mode_block: dict, arm: str) -> tuple[list[int], list[list[float]]]:
         """Return the horizon axis and one error curve per seed for one arm.
 
@@ -576,21 +605,38 @@ class HorizonFit:
         Returns:
             The horizons and one curve per seed. Both are empty when the arm
             carries no readable series.
+
+        Raises:
+            ValueError: If the declared error metric's key is absent at every
+                horizon, which is a selection fault rather than a partial run.
         """
+        key = model_error_key(self.error_metric)
         horizons = sorted_horizons(mode_block.get("horizons", {}))
+        blocks = {
+            horizon: mode_block["horizons"][horizon]
+            .get("arms", {})
+            .get(arm, {})
+            .get(key)
+            for horizon in horizons
+        }
+        # Absent everywhere is the metric being read under the wrong name;
+        # absent at one horizon is a run that did not finish.
+        if horizons and all(block is None for block in blocks.values()):
+            raise ValueError(
+                f"{mode_block.get('observation_mode')} arm {arm} declares "
+                f"{ERROR_METRIC_KEY} {self.error_metric!r} but carries no "
+                f"{key} at any of its {len(horizons)} horizons. The artefact "
+                "was scored under a different metric, or the declaration is "
+                "wrong."
+            )
         columns = []
         for horizon in horizons:
-            block = (
-                mode_block["horizons"][horizon]
-                .get("arms", {})
-                .get(arm, {})
-                .get(MODEL_CE_KEY)
-            )
+            block = blocks[horizon]
             values = None if block is None else block.get("values")
             if not values:
                 message = (
                     f"{mode_block.get('observation_mode')} arm {arm} carries no "
-                    f"per-seed {MODEL_CE_KEY} at horizon {horizon}, so no curve "
+                    f"per-seed {key} at horizon {horizon}, so no curve "
                     f"can be fitted"
                 )
                 logger.warning("%s", message)
@@ -770,6 +816,7 @@ class HorizonFit:
         """
         self.flags = []
         sweep = self.load()
+        self.error_metric = self._declared_error_metric(sweep)
         modes = sweep.get("observation_modes") or sorted(sweep.get("by_mode", {}))
         payload = {
             "run_name": sweep.get("run_name", self.run_name),

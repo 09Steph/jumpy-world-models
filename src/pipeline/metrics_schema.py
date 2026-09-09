@@ -38,13 +38,69 @@ GAP_SIGN_CONVENTION: str = "primary_minus_secondary"
 # carry a flag that run rejects.
 PARAMS_TREES_BOTH: str = "both"
 
+# Which error the artefact's model series holds. Declared by the run rather
+# than inferred from which keys are present, so a run scored under one metric
+# can never be read under the other.
+ERROR_METRIC_KEY: str = "error_metric"
+ERROR_METRIC_CROSS_ENTROPY: str = "cross_entropy"
+ERROR_METRIC_MSE: str = "mse"
+
 # Keys inside one per-horizon block.
 WINDOWS_KEY: str = "num_windows"
 MODEL_CE_KEY: str = "model_cross_entropy"
+MODEL_MSE_KEY: str = "model_mse"
 COPY_CE_KEY: str = "copy_cross_entropy"
+COPY_MSE_KEY: str = "copy_mse"
 SKILL_SCORE_KEY: str = "copy_normalised_skill_score"
 CLIMATOLOGY_KEY: str = "climatology_entropy"
 PER_CELL_ACCURACY_KEY: str = "per_cell_accuracy"
 EXACT_MATCH_KEY: str = "exact_grid_match_rate"
 AGENT_ACCURACY_KEY: str = "agent_position_accuracy"
 SMOOTHING_KEY: str = "smoothing_report"
+
+
+# The per-horizon keys each declared error metric writes its series to. The
+# model and the copy baseline are scored under one metric, so both are selected
+# from the same declaration rather than named at each call site.
+MODEL_ERROR_KEYS: dict[str, str] = {
+    ERROR_METRIC_CROSS_ENTROPY: MODEL_CE_KEY,
+    ERROR_METRIC_MSE: MODEL_MSE_KEY,
+}
+COPY_ERROR_KEYS: dict[str, str] = {
+    ERROR_METRIC_CROSS_ENTROPY: COPY_CE_KEY,
+    ERROR_METRIC_MSE: COPY_MSE_KEY,
+}
+
+
+def model_error_key(error_metric: str) -> str:
+    """Return the per-horizon key holding the model series for one metric.
+
+    Args:
+        error_metric: The value the artefact declares under ERROR_METRIC_KEY.
+
+    Raises:
+        ValueError: If the declared metric is not one this codebase writes.
+    """
+    if error_metric not in MODEL_ERROR_KEYS:
+        raise ValueError(
+            f"unknown {ERROR_METRIC_KEY} {error_metric!r}, expected one of "
+            f"{sorted(MODEL_ERROR_KEYS)}"
+        )
+    return MODEL_ERROR_KEYS[error_metric]
+
+
+def copy_error_key(error_metric: str) -> str:
+    """Return the per-horizon key holding the copy series for one metric.
+
+    Args:
+        error_metric: The value the artefact declares under ERROR_METRIC_KEY.
+
+    Raises:
+        ValueError: If the declared metric is not one this codebase writes.
+    """
+    if error_metric not in COPY_ERROR_KEYS:
+        raise ValueError(
+            f"unknown {ERROR_METRIC_KEY} {error_metric!r}, expected one of "
+            f"{sorted(COPY_ERROR_KEYS)}"
+        )
+    return COPY_ERROR_KEYS[error_metric]
