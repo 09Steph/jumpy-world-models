@@ -30,9 +30,12 @@ from config import (
     ARMS,
     ENV_FAMILY_NAVIX,
     ENV_FAMILY_NLE,
+    OBS_VALUE_RANGE_RGB,
     OFFLINE_SOURCE,
+    REPRESENTATION_RGB,
     ExperimentConfig,
     SamplerMode,
+    assert_config_resolved,
     checkpoints_dir,
     env_family,
 )
@@ -58,7 +61,9 @@ from src.models.jumpy_transformer import (
     predict_endpoint,
 )
 from src.models.losses import (
+    check_observation_values_in_bounds,
     check_observation_values_in_range,
+    pixel_reconstruction_loss,
     reconstruction_loss,
 )
 from src.pipeline.base import ArmScopedStage
@@ -300,7 +305,11 @@ def build_training_source(config: ExperimentConfig):
     """
     family = env_family(config.env.name)
     if family == ENV_FAMILY_NAVIX:
-        return NavixTrajectorySource(config.env)
+        return NavixTrajectorySource(
+            config.env,
+            representation=config.data.representation,
+            stored_modes=config.data.modes_stored(),
+        )
     if family == ENV_FAMILY_NLE:
         source, _ = build_offline_source(OFFLINE_SOURCE)
         return source
@@ -319,8 +328,8 @@ def build_arm(
     One builder for every arm, so the matched parameter budget holds by
     construction. Module-level because the evaluator restores this stage's
     checkpoint against a template and has to build a structurally identical
-    model. The configured extent fixes encoder depth at the value both modes
-    share.
+    model. The configured extent fixes encoder depth at the value every mode
+    shares.
 
     Args:
         config: The composed experiment configuration.
@@ -331,10 +340,12 @@ def build_arm(
         The unbound model and its initialised parameter tree.
 
     Raises:
-        ValueError: If the arm is not one of config.ARMS.
+        ValueError: If the arm is not one of config.ARMS, or if the
+            configuration's observation contract is unresolved.
     """
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}, expected one of {ARMS}")
+    assert_config_resolved(config)
     source = build_training_source(config)
     spec = source.spec(observation_mode)
     builder = (
@@ -345,11 +356,12 @@ def build_arm(
     )
     field = spec.single_field()
     height, width = field.shape
+    num_channels = config.model.obs_channels
     init_key = jax.random.PRNGKey(config.model_seed)
     params_key, dropout_key = jax.random.split(init_key)
     params = model.init(
         {"params": params_key, "dropout": dropout_key},
-        jnp.zeros((1, height, width, len(field.cardinality)), jnp.int32),
+        jnp.zeros((1, height, width, num_channels), jnp.int32),
         jnp.zeros((1, config.train.horizon_max), jnp.int32),
         jnp.ones((1,), jnp.int32),
         deterministic=True,
@@ -580,6 +592,18 @@ class TrainStage(ArmScopedStage):
         return build_arm(self.config, self.observation_mode, arm=self.arm)
 
     @property
+    def _value_range(self) -> tuple[int, int] | None:
+        """Return the stored-value bounds this arm trains against.
+
+        Returns:
+            The bounds for a continuous representation, None for a discrete
+            one, which selects the categorical loss instead.
+        """
+        if self.config.data.representation == REPRESENTATION_RGB:
+            return OBS_VALUE_RANGE_RGB
+        return None
+
+    @property
     def _training_method(self):
         """Return the model method this arm's loss is computed through.
 
@@ -608,13 +632,15 @@ class TrainStage(ArmScopedStage):
         *,
         deterministic: bool = False,
     ) -> jax.Array:
-        """Return the mean endpoint cross-entropy over one batch.
+        """Return the mean endpoint reconstruction loss over one batch.
 
         The endpoint is the only supervised state, and one loss serves every
-        arm. Arm 3's one-step objective is this loss on batches drawn at h = 1,
-        where the endpoint is the next state. Mean over the batch, sum over
-        cells, so the value scales with grid size and is not comparable across
-        observation modes without normalisation.
+        arm. A discrete representation is scored by categorical cross-entropy
+        and a continuous one by squared error. Arm 3's one-step objective is
+        this loss on batches drawn at h = 1, where the endpoint is the next
+        state. Mean over the batch, sum over cells, so the value scales with
+        grid size and is not comparable across observation modes without
+        normalisation.
 
         Args:
             model: The unbound transformer.
@@ -642,6 +668,15 @@ class TrainStage(ArmScopedStage):
             method=self._training_method,
         )
         flat = targets.reshape(targets.shape[0], -1)
+        if self._value_range is not None:
+            # The decoder returns one array in a list for every representation.
+            # A continuous prediction is that single array, whose last axis is
+            # channels rather than classes, so it is taken rather than iterated.
+            return jnp.mean(
+                pixel_reconstruction_loss(
+                    logits[0], flat, targets.shape[1:3], self._value_range
+                )
+            )
         return jnp.mean(
             reconstruction_loss(logits, flat, targets.shape[1:3])
         )
@@ -655,9 +690,9 @@ class TrainStage(ArmScopedStage):
     ) -> TrainedState:
         """Run the gradient loop and return the trained state.
 
-        The cardinality check runs once, on the first batch. Each step's key is
-        folded from the step number, so a resumed run draws the same sequence as
-        an uninterrupted one. Both losses are taken at the pre-update
+        The observation-domain check runs once, on the first batch. Each step's
+        key is folded from the step number, so a resumed run draws the same
+        sequence as an uninterrupted one. Both losses are taken at the pre-update
         parameters, the best model is sampled at the logging interval, and the
         validation batch is drawn once and held through `next_batch`. The first
         timing interval includes compilation.
@@ -694,7 +729,7 @@ class TrainStage(ArmScopedStage):
         for step in range(started_at, total):
             batch, dropout_key = self._draw(sampler, base_key, step)
             if step == started_at:
-                self._check_cardinality(batch)
+                self._check_observation_domain(batch)
             new_params, new_opt_state, loss_value = compute_step(
                 state.params,
                 state.opt_state,
@@ -848,8 +883,7 @@ class TrainStage(ArmScopedStage):
 
         Returns:
             The validation loss as a host float when this step logged,
-            otherwise None. The validation loss, not the training loss. The
-            best model is selected on it.
+            otherwise None.
         """
         total = self.config.train.total_steps
         completed = step + 1
@@ -898,7 +932,7 @@ class TrainStage(ArmScopedStage):
             batch: The fixed validation batch, drawn once per run.
 
         Returns:
-            The mean endpoint cross-entropy on that batch, as a host float.
+            The mean endpoint loss on that batch, as a host float.
         """
         return float(
             self._validation_step(
@@ -1098,22 +1132,28 @@ class TrainStage(ArmScopedStage):
             total_steps=budget,
         )
 
-    def _check_cardinality(self, batch: WindowBatch) -> None:
-        """Raise if any observation code falls outside its channel's range.
+    def _check_observation_domain(self, batch: WindowBatch) -> None:
+        """Raise if any observation falls outside its declared domain.
 
-        Once on the first batch. An out-of-range code gathers a meaningless
-        log-probability instead of raising, and it is a dataset property.
+        Once on the first batch. A discrete observation is checked against its
+        class counts, a continuous one against its stored bounds. An
+        out-of-range value scores meaninglessly instead of raising, and it is a
+        dataset property.
 
         Args:
             batch: The first training batch drawn this run.
 
         Raises:
-            ValueError: If any code is outside its channel's class range.
+            ValueError: If any value is outside the declared domain.
         """
+        flat = batch.targets.reshape(batch.targets.shape[0], -1)
+        if self._value_range is not None:
+            check_observation_values_in_bounds(
+                flat, batch.targets.shape[1:3], self._value_range
+            )
+            return
         check_observation_values_in_range(
-            batch.targets.reshape(batch.targets.shape[0], -1),
-            batch.targets.shape[1:3],
-            self.config.model.obs_channel_classes,
+            flat, batch.targets.shape[1:3], self.config.model.obs_channel_classes
         )
 
     def _decode_one_prediction(self, model, params, sampler: WindowSampler) -> None:
@@ -1187,8 +1227,9 @@ class TrainStage(ArmScopedStage):
         skipped. Before training it reports the full budget, after training
         what happened, and the stage re-reads this once `run()` returns.
 
-        Absent: the checkpoint interval and the rematerialisation flag, neither
-        of which changes the weights.
+        Absent: the checkpoint interval and the rematerialisation flag. The
+        interval does not touch the weights, and remat changes how the gradient
+        is computed rather than what it is.
 
         Returns:
             JSON-serialisable identity fields.

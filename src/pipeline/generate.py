@@ -1,13 +1,15 @@
-"""Trajectory generation stage. Rolls a uniform-random policy and stores episodes.
+"""Trajectory generation stage. Rolls a behaviour policy and stores episodes.
 
 The only stage that touches an environment. It writes a dataset plus the
 measurements the sampler and the observability comparison need, using
 ``NavixEnv``'s compiled batched step. A batched rollout interleaves episodes, so
-``cut_episodes`` finds the boundaries per row, and both observation modes are
-re-rendered from one rollout's state.
+``cut_episodes`` finds the boundaries per row, and every stored observation mode
+is re-rendered from one rollout's state.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import json
 from collections.abc import Sequence
@@ -19,14 +21,22 @@ import navix
 import numpy as np
 
 from config import (
+    CONTINUOUS_VALUE_RANGES,
     DECODED_SAMPLES_FILENAME,
     OBS_CHANNEL_CLASSES_NAVIX,
+    POLICY_OBSERVATION_NOT_APPLICABLE,
+    POLICY_PPO,
+    PPO_ENTROPY_COEFFICIENT,
+    PPO_NUM_STEPS,
+    PPO_POLICY_OBSERVATION,
+    REPRESENTATION_SYMBOLIC,
     TRAJECTORY_SHARD_GLOB,
     TRAJECTORY_SHARD_TEMPLATE,
     TRAJECTORY_STATS_FILENAME,
     ExperimentConfig,
     config_snapshot,
 )
+from src.data.ppo_collect import collect_rollout_arrays
 from src.data.trajectory import (
     ObservationMode,
     Trajectory,
@@ -34,12 +44,14 @@ from src.data.trajectory import (
 from src.data.trajectory_source import (
     NAVIX_GOAL_ENTITY,
     NAVIX_OBSERVATION_FNS,
-    UNIFORM_RANDOM_POLICY,
 )
 from src.data.trajectory_store import TrajectoryStore
 from src.envs.navix_env import NavixEnv
 from src.envs.slip import SLIP_KEY_FOLD_INDEX, apply_slip
-from src.models.losses import check_observation_values_in_range
+from src.models.losses import (
+    check_observation_values_in_bounds,
+    check_observation_values_in_range,
+)
 from src.pipeline.base import Stage
 from src.utils.logging_setup import get_logger
 from src.utils.paths import ensure_dir, safe_rel
@@ -59,12 +71,13 @@ DECODE_CHANNEL: int = 0
 class _Rollout:  # pylint: disable=too-many-instance-attributes
     """One batched rollout, as numpy arrays, before it is cut into episodes.
 
-    Observations carry num_steps + 1 entries, index 0 being the reset. Every
-    other stream carries num_steps, where entry i - 1 is the result of the step
-    reaching index i.
+    Observations, goal positions and timestep indices carry num_steps + 1
+    entries, index 0 being the reset. The per-step streams carry num_steps,
+    where entry i - 1 is the result of the step reaching index i.
 
     Attributes:
-        observations: Per mode, shape (num_steps + 1, num_envs, *grid, 3).
+        observations: Per mode, shape (num_steps + 1, num_envs, *grid,
+            channels).
         actions: Commanded actions, shape (num_steps, num_envs).
         rewards: Shape (num_steps, num_envs).
         terminated: Shape (num_steps, num_envs).
@@ -87,7 +100,7 @@ class _Rollout:  # pylint: disable=too-many-instance-attributes
 
 
 class GenerateTrajectoriesStage(Stage):
-    """Roll a uniform-random policy in NAVIX and write complete trajectories.
+    """Roll a behaviour policy in NAVIX and write complete trajectories.
 
     Attributes:
         store: The trajectory store this stage writes through.
@@ -109,7 +122,7 @@ class GenerateTrajectoriesStage(Stage):
         """
         trajectories = self._generate()
         # Before the first shard is written.
-        self._assert_cardinality(trajectories)
+        self._assert_observation_domain(trajectories)
         target = self.dataset_dir
         ensure_dir(target)
         self._write_shards(trajectories, target)
@@ -123,6 +136,14 @@ class GenerateTrajectoriesStage(Stage):
             Exactly `config.data.num_trajectories` complete episodes, or every
             complete episode found if the safety ceiling was hit first.
         """
+        if self.config.data.collection_policy == POLICY_PPO:
+            trajectories = self.cut_episodes(self._roll_ppo())
+            logger.info(
+                "PPO collection yielded %d complete episodes", len(trajectories)
+            )
+            # Not trimmed: the frame budget sizes a PPO dataset, and the
+            # episode count follows from it rather than bounding it.
+            return trajectories
         env = NavixEnv(self.config.env)
         rollout = self._roll(env)
         trajectories = self.cut_episodes(rollout)
@@ -188,22 +209,63 @@ class GenerateTrajectoriesStage(Stage):
         )
         return streams.finish()
 
-    @staticmethod
+    def _roll_ppo(self) -> _Rollout:
+        """Train a PPO policy and return the experience it trained on.
+
+        Returns:
+            The accumulated rollout, in the same shape the uniform-random path
+            produces, so `cut_episodes` treats both identically.
+        """
+        return _Rollout(
+            **collect_rollout_arrays(
+                config=self.config.env,
+                budget_frames=self.config.data.ppo_budget_frames,
+                num_steps=PPO_NUM_STEPS,
+                entropy_coefficient=PPO_ENTROPY_COEFFICIENT,
+                observation_fn=NAVIX_OBSERVATION_FNS[REPRESENTATION_SYMBOLIC][
+                    ObservationMode.TOP_DOWN
+                ],
+                observation_fns=self.observation_fns,
+                rng=jax.random.PRNGKey(self.config.data_seed),
+            )
+        )
+
+    @property
+    def stored_modes(self) -> tuple[ObservationMode, ...]:
+        """Return the observation modes this run writes, as enum members.
+
+        Returns:
+            The configured stored set, in its configured order.
+        """
+        return tuple(
+            ObservationMode(mode) for mode in self.config.data.modes_stored()
+        )
+
+    @property
+    def observation_fns(self) -> dict[ObservationMode, Callable]:
+        """Return the render function for each stored mode.
+
+        Returns:
+            One function per stored mode, under this run's representation.
+        """
+        available = NAVIX_OBSERVATION_FNS[self.config.data.representation]
+        return {mode: available[mode] for mode in self.stored_modes}
+
     def _observe(
-        timestep: navix.environments.Timestep,
+        self, timestep: navix.environments.Timestep
     ) -> dict[ObservationMode, np.ndarray]:
-        """Render every observation mode from one batched timestep's state.
+        """Render each stored observation mode from one batched timestep.
 
         Args:
             timestep: Batched Timestep.
 
         Returns:
-            One numpy array per mode, batch axis retained, converted off-device
-            immediately.
+            One numpy array per stored mode, batch axis retained, converted off
+            device immediately.
         """
         return {
             mode: np.asarray(jax.vmap(fn)(timestep.state))
-            for mode, fn in NAVIX_OBSERVATION_FNS.items()
+            for mode, fn in self.observation_fns.items()
         }
 
     def cut_episodes(self, rollout: _Rollout) -> list[Trajectory]:
@@ -267,7 +329,7 @@ class GenerateTrajectoriesStage(Stage):
             provenance={
                 "env_name": self.config.env.name,
                 "max_episode_steps": self.config.env.max_episode_steps,
-                "policy": UNIFORM_RANDOM_POLICY,
+                "policy": self.config.data.collection_policy,
                 "seed": self.config.data_seed,
                 "env_row": row,
                 "rollout_start_index": start,
@@ -275,44 +337,57 @@ class GenerateTrajectoriesStage(Stage):
             executed_actions=rollout.executed_actions[start:end, row],
         )
 
-    def _assert_cardinality(self, trajectories: Sequence[Trajectory]) -> None:
-        """Raise if any observation code exceeds its declared class count.
+    def _assert_observation_domain(
+        self, trajectories: Sequence[Trajectory]
+    ) -> None:
+        """Raise if any observation falls outside its declared domain.
 
-        Reuses the loss's checker. Never widen the declaration to fit what was
-        measured, which sizes an output head for an unexplained value.
+        A discrete representation declares class counts and is checked against
+        them; a continuous one declares stored bounds and is checked against
+        those. Never widen the declaration to fit what was measured, which sizes
+        an output head for an unexplained value.
 
         Args:
-            trajectories: Episodes to check, in both observation modes.
+            trajectories: Episodes to check, in every stored observation mode.
 
         Raises:
-            ValueError: If any code is out of range, naming the mode, the
-                channel, the observed maximum and the declaration.
+            ValueError: If any value is outside the declaration, naming the
+                mode, the observed maxima and the declaration.
         """
-        for mode in ObservationMode:
+        value_range = CONTINUOUS_VALUE_RANGES.get(self.config.data.representation)
+        declaration = (
+            value_range if value_range is not None else OBS_CHANNEL_CLASSES_NAVIX
+        )
+        for mode in self.stored_modes:
             for trajectory in trajectories:
                 frames = np.asarray(trajectory.observations[mode])
-                grid_shape = frames.shape[1:3]
+                grid_shape = (int(frames.shape[1]), int(frames.shape[2]))
+                flat = frames.reshape(frames.shape[0], -1)
                 try:
-                    check_observation_values_in_range(
-                        frames.reshape(frames.shape[0], -1),
-                        (int(grid_shape[0]), int(grid_shape[1])),
-                        OBS_CHANNEL_CLASSES_NAVIX,
-                    )
+                    if value_range is not None:
+                        check_observation_values_in_bounds(
+                            flat, grid_shape, value_range
+                        )
+                    else:
+                        check_observation_values_in_range(
+                            flat, grid_shape, OBS_CHANNEL_CLASSES_NAVIX
+                        )
                 except ValueError as error:
                     observed = [
                         int(frames[..., channel].max())
                         for channel in range(frames.shape[-1])
                     ]
                     raise ValueError(
-                        f"{self.config.env.name} emits observation codes outside "
-                        f"OBS_CHANNEL_CLASSES_NAVIX {OBS_CHANNEL_CLASSES_NAVIX} in "
-                        f"{mode.value}: observed per-channel maxima {observed}. "
-                        f"Nothing has been written. {error}"
+                        f"{self.config.env.name} emits observation values "
+                        f"outside {declaration} in {mode.value}: observed "
+                        f"per-channel maxima {observed}. Nothing has been "
+                        f"written. {error}"
                     ) from error
         logger.info(
-            "cardinality verified for %d trajectories in both modes against %s",
+            "observation domain verified for %d trajectories in %s against %s",
             len(trajectories),
-            OBS_CHANNEL_CLASSES_NAVIX,
+            ", ".join(mode.value for mode in self.stored_modes),
+            declaration,
         )
 
     def _channel_measurements(self, trajectories: Sequence[Trajectory]) -> dict:
@@ -332,7 +407,7 @@ class GenerateTrajectoriesStage(Stage):
             counts and an informative flag.
         """
         measurements: dict[str, dict] = {}
-        for mode in ObservationMode:
+        for mode in self.stored_modes:
             frames = np.concatenate(
                 [np.asarray(t.observations[mode]) for t in trajectories]
             )
@@ -369,7 +444,7 @@ class GenerateTrajectoriesStage(Stage):
         shards = sorted(self.dataset_dir.glob(TRAJECTORY_SHARD_GLOB))
         identity.update(
             {
-                "num_trajectories": self.config.data.num_trajectories,
+                **self._dataset_size_identity(),
                 "shard_size": self.config.data.shard_size,
                 "storage_format": self.config.data.storage_format,
                 "max_episode_steps": self.config.env.max_episode_steps,
@@ -381,7 +456,16 @@ class GenerateTrajectoriesStage(Stage):
                 "disable_early_termination": (
                     self.config.env.disable_early_termination
                 ),
-                "observation_modes": [mode.value for mode in ObservationMode],
+                # The behaviour policy and the view it acted on. Left out, two
+                # datasets differing only in how they were collected share a
+                # hash, and the second reports complete without generating.
+                "policy": self.config.data.collection_policy,
+                "policy_observation": self._policy_observation(),
+                # The rendering the observations were stored in. Left out, an
+                # RGB run matches a symbolic sentinel, skips generation and
+                # trains on symbolic data while reporting itself as RGB.
+                "representation": self.config.data.representation,
+                "observation_modes": list(self.config.data.modes_stored()),
                 "split_fractions": [
                     self.config.data.train_fraction,
                     self.config.data.validation_fraction,
@@ -392,6 +476,23 @@ class GenerateTrajectoriesStage(Stage):
             }
         )
         return identity
+
+    def _dataset_size_identity(self) -> dict:
+        """Return the field that sizes this dataset, which the policy selects.
+
+        A PPO dataset is sized by its frame budget and its episode count falls
+        out of the run, so a count written afterwards could not discriminate
+        beforehand.
+        """
+        if self.config.data.collection_policy == POLICY_PPO:
+            return {"ppo_budget_frames": self.config.data.ppo_budget_frames}
+        return {"num_trajectories": self.config.data.num_trajectories}
+
+    def _policy_observation(self) -> str:
+        """Return the view the collecting policy read, or that it read none."""
+        if self.config.data.collection_policy == POLICY_PPO:
+            return PPO_POLICY_OBSERVATION
+        return POLICY_OBSERVATION_NOT_APPLICABLE
 
     def _write_shards(self, trajectories: list[Trajectory], target: Path) -> None:
         """Write the trajectories out in fixed-size shards.
@@ -463,8 +564,6 @@ class GenerateTrajectoriesStage(Stage):
 
 class _StreamAccumulator:
     """Collects per-step rollout arrays and stacks them once at the end.
-
-    Growing a numpy array per step would reallocate the whole rollout each step.
 
     Attributes:
         num_steps: Steps accumulated so far, excluding the reset.
@@ -564,7 +663,7 @@ def _row_spans(rollout: _Rollout, row: int) -> list[tuple[int, int]]:
         row: Environment index.
 
     Returns:
-        Inclusive (start, end) index pairs, one per COMPLETE episode. A trailing
+        Inclusive (start, end) index pairs, one per complete episode. A trailing
         run of observations with no episode end is omitted.
     """
     starts = np.flatnonzero(rollout.timestep_index[:, row] == 0)

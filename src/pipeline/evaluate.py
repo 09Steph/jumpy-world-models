@@ -30,6 +30,7 @@ import numpy as np
 
 from config import (
     ARM_DIRECT,
+    CONTINUOUS_VALUE_RANGES,
     EVALUATED_SPLITS,
     EVALUATION_BATCH_CHUNK,
     METRICS_TEMPLATE,
@@ -55,6 +56,7 @@ from src.eval.baselines import (
     calibrated_copy_tables,
     climatology_entropy,
     copy_cross_entropy,
+    copy_mse,
     copy_transition_counts,
     smoothing_report,
 )
@@ -65,6 +67,7 @@ from src.eval.metrics import (
     agent_position_accuracy,
     exact_grid_match_rate,
     model_cross_entropy,
+    model_mse,
     mover_restricted_accuracy,
     per_cell_accuracy,
 )
@@ -80,10 +83,11 @@ from src.pipeline.metrics_schema import (
     AGENT_ACCURACY_KEY,
     ARM_KEY,
     CLIMATOLOGY_KEY,
-    COPY_CE_KEY,
+    ERROR_METRIC_CROSS_ENTROPY,
+    ERROR_METRIC_KEY,
+    ERROR_METRIC_MSE,
     EXACT_MATCH_KEY,
     GAP_SIGN_CONVENTION,
-    MODEL_CE_KEY,
     OBSERVATION_MODE_KEY,
     PARAMS_PROVENANCE_KEY,
     PARAMS_TREES_BOTH,
@@ -98,6 +102,8 @@ from src.pipeline.metrics_schema import (
     SOURCE_RUN_NAME_KEY,
     SPLIT_KEY,
     WINDOWS_KEY,
+    copy_error_key,
+    model_error_key,
 )
 from src.pipeline.prepare import frozen_evaluation_key
 from src.pipeline.train import (
@@ -121,7 +127,7 @@ logger = get_logger(__name__)
 # otherwise, leaving the recorded size describing a path that does not exist.
 PROBABILITY_LOG_TEMPLATE: str = "probability_log_{mode}.npz"
 
-# Where the SECONDARY parameter tree's probability log goes: a subdirectory,
+# Where the secondary parameter tree's probability log goes: a subdirectory,
 # with the filename unchanged.
 #
 # A directory and not a filename variant, because sweep.probability_log_paths
@@ -262,6 +268,29 @@ class EvaluateStage(ArmScopedStage):
     dataset_derived: bool = False
 
     @property
+    def value_range(self) -> tuple[int, int] | None:
+        """Return the stored-value bounds of this run's representation.
+
+        Returns:
+            The bounds for a continuous representation, None for a discrete
+            one. Keyed through the table so a second continuous representation
+            joins by adding a row there.
+        """
+        return CONTINUOUS_VALUE_RANGES.get(self.config.data.representation)
+
+    @property
+    def error_metric(self) -> str:
+        """Return the error metric this run's representation is scored under.
+
+        Returns:
+            The value written under ERROR_METRIC_KEY and read by every
+            downstream key selection.
+        """
+        if self.value_range is None:
+            return ERROR_METRIC_CROSS_ENTROPY
+        return ERROR_METRIC_MSE
+
+    @property
     def scores_both_trees(self) -> bool:
         """Return whether this pass scores both stored parameter trees."""
         return self.split is SplitName.TEST
@@ -275,7 +304,7 @@ class EvaluateStage(ArmScopedStage):
 
     @property
     def source_config(self) -> ExperimentConfig:
-        """Return the configuration naming the run this stage READS from.
+        """Return the configuration naming the run this stage reads from.
 
         Every write keys on `config.run_name`; only the dataset and the
         checkpoint follow this. A pass that read and wrote one tree would drop
@@ -662,6 +691,11 @@ class EvaluateStage(ArmScopedStage):
             ARM_KEY: self.arm,
             OBSERVATION_MODE_KEY: self.config.sampler.observation_mode,
             SPLIT_KEY: self.split.value,
+            # Declared by the run that scored it rather than inferred from
+            # which keys are present. This stage is the one that knows the
+            # representation, so it is the one that says which error the model
+            # series holds.
+            ERROR_METRIC_KEY: self.error_metric,
             "config": config_snapshot(self.config),
             # Read by the aggregator's truncation guard. From the checkpoint
             # not the config, so a truncated run is visible here.
@@ -821,17 +855,22 @@ class EvaluateStage(ArmScopedStage):
         # Computed on the whole slice, not per block. It reads observations and
         # never the logits, and observations are small enough that the slice
         # fits where the logits do not. Combining it per block would reassociate
-        # a mean over log-probabilities whose dynamic range is wide, measured
-        # drifting 1.65e-5 where the model's own metrics drift 1e-7.
+        # a mean over log-probabilities whose dynamic range is wide.
+        #
+        # On the slice being scored, for both representations. The model's own
+        # error is measured here, so a copy measured on the training draw would
+        # put two splits either side of the skill score's division.
         whole = jnp.asarray(rows)
-        copy_ce = float(
-            copy_cross_entropy(
-                baseline["tables"],
+        copy_value = (
+            self._copy_error_on(
+                baseline,
                 self._flatten(batch.states[whole]),
                 self._flatten(batch.targets[whole]),
                 grid_shape,
             )
-        ) if rows.size else None
+            if rows.size
+            else None
+        )
         accumulators: dict[str, _WeightedMean] = {}
         collected: list[list] = []
         for start in range(0, int(rows.size), EVALUATION_BATCH_CHUNK):
@@ -857,13 +896,46 @@ class EvaluateStage(ArmScopedStage):
                         [channel[jnp.asarray(local)] for channel in logits]
                     )
             del logits
-        block = self._finalise_block(rows, accumulators, baseline, copy_ce)
+        block = self._finalise_block(
+            rows, accumulators, baseline, copy_value, self.error_metric
+        )
         if not collected:
             return block, None
         return block, [
             jnp.concatenate([part[channel] for part in collected], axis=0)
             for channel in range(len(collected[0]))
         ]
+
+    def _copy_error_on(
+        self,
+        baseline: dict,
+        states: jax.Array,
+        targets: jax.Array,
+        grid_shape: tuple[int, int],
+    ) -> float:
+        """Return the stationary copy's error on the windows being scored.
+
+        The discrete copy is a fitted conditional, so its tables come from the
+        training draw and are applied here. The continuous copy fits nothing
+        and is the squared difference between the two observations, so it is
+        computed here outright.
+
+        Args:
+            baseline: The baseline report at this horizon.
+            states: Flattened start observations of the scored windows.
+            targets: Flattened end observations of the same windows.
+            grid_shape: Spatial grid shape, (height, width).
+
+        Returns:
+            The copy baseline's error under this run's declared metric.
+        """
+        if self.value_range is None:
+            return float(
+                copy_cross_entropy(
+                    baseline["tables"], states, targets, grid_shape
+                )
+            )
+        return float(copy_mse(states, targets, grid_shape, self.value_range))
 
     def _score_block(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -891,30 +963,56 @@ class EvaluateStage(ArmScopedStage):
         Returns:
             {metric: (value, weight)}.
         """
-        mover = mover_restricted_accuracy(logits, targets, states, grid_shape)
-        changed = mover[MOVER_CHANGED_CELLS_KEY]
+        # Every categorical leg argmaxes over a class axis, which a continuous
+        # representation does not have. Keyed through CONTINUOUS_VALUE_RANGES so
+        # a second continuous representation joins by adding a row there, and
+        # undefined rather than substituted: no continuous analogue is
+        # pre-registered. Undefined is already a supported state through
+        # aggregation.
+        continuous = self.value_range is not None
+        mover = (
+            None
+            if continuous
+            else mover_restricted_accuracy(logits, targets, states, grid_shape)
+        )
+        changed = None if mover is None else mover[MOVER_CHANGED_CELLS_KEY]
         return {
-            MODEL_CE_KEY: (
-                float(model_cross_entropy(logits, targets, grid_shape)),
+            model_error_key(self.error_metric): (
+                float(
+                    model_mse(logits[0], targets, grid_shape, self.value_range)
+                    if continuous
+                    else model_cross_entropy(logits, targets, grid_shape)
+                ),
                 windows,
             ),
             PER_CELL_ACCURACY_KEY: (
-                float(per_cell_accuracy(logits, targets, grid_shape)),
+                None
+                if continuous
+                else float(per_cell_accuracy(logits, targets, grid_shape)),
                 windows,
             ),
             EXACT_MATCH_KEY: (
-                float(exact_grid_match_rate(logits, targets, grid_shape)),
+                None
+                if continuous
+                else float(exact_grid_match_rate(logits, targets, grid_shape)),
                 windows,
             ),
-            MOVER_ACCURACY_KEY: (mover[MOVER_ACCURACY_KEY], changed * windows),
+            MOVER_ACCURACY_KEY: (
+                None if mover is None else mover[MOVER_ACCURACY_KEY],
+                0 if changed is None else changed * windows,
+            ),
             MOVER_CHANGED_CELLS_KEY: (changed, windows),
-            MOVER_EXCLUDED_KEY: (mover[MOVER_EXCLUDED_KEY], windows),
+            MOVER_EXCLUDED_KEY: (
+                None if mover is None else mover[MOVER_EXCLUDED_KEY],
+                windows,
+            ),
             # Undefined in the egocentric mode, where the agent sits at the
             # centre by construction, so the number would be a constant that
             # reads as a finding.
             AGENT_ACCURACY_KEY: (
                 float(agent_position_accuracy(logits, targets, grid_shape))
-                if self.config.sampler.observation_mode == OBS_MODE_TOP_DOWN
+                if not continuous
+                and self.config.sampler.observation_mode == OBS_MODE_TOP_DOWN
                 else None,
                 windows,
             ),
@@ -925,33 +1023,43 @@ class EvaluateStage(ArmScopedStage):
         rows: np.ndarray,
         accumulators: dict,
         baseline: dict,
-        copy_ce: float | None,
+        copy_value: float | None,
+        error_metric: str,
     ) -> dict:
         """Combine one horizon's blocks into its reported metric block.
 
         Key order follows the block a single unblocked pass wrote, so the
-        artefact is unchanged byte for byte and not merely by value.
+        artefact is unchanged byte for byte and not merely by value. Under
+        cross-entropy the two resolved keys are the names that block already
+        carried, so a discrete run's artefact is unchanged.
+
+        The model and the copy resolve from one declaration, so the skill score
+        can only ever divide two measurements of the same quantity. Dividing a
+        squared error by a cross-entropy would not raise.
 
         Args:
             rows: This horizon's rows in the evaluation batch.
             accumulators: The combined per-metric accumulators.
             baseline: The copy baseline's report at this horizon.
-            copy_ce: The baseline's cross-entropy, measured on the whole slice.
+            copy_value: The copy baseline's error, measured on the whole slice.
+            error_metric: The metric this run is scored under.
 
         Returns:
             One horizon's metric block.
         """
         empty = _WeightedMean()
-        model_ce = accumulators.get(MODEL_CE_KEY, empty).value()
+        model_value = accumulators.get(
+            model_error_key(error_metric), empty
+        ).value()
         return {
             WINDOWS_KEY: int(rows.size),
-            MODEL_CE_KEY: model_ce,
-            COPY_CE_KEY: copy_ce,
+            model_error_key(error_metric): model_value,
+            copy_error_key(error_metric): copy_value,
             # Stored, not derived at plotting time, so the reported number and
             # this one cannot diverge.
             SKILL_SCORE_KEY: (
-                1.0 - model_ce / copy_ce
-                if model_ce is not None and copy_ce
+                1.0 - model_value / copy_value
+                if model_value is not None and copy_value
                 else None
             ),
             CLIMATOLOGY_KEY: baseline[CLIMATOLOGY_KEY],
@@ -977,10 +1085,31 @@ class EvaluateStage(ArmScopedStage):
     def _baseline_at(
         self, training: WindowBatch, horizon: int, grid_shape: tuple[int, int]
     ) -> dict:
-        """Estimate the copy baseline and the climatology floor at one horizon.
+        """Estimate what the copy baseline needs fitting at one horizon.
+
+        Both branches return the same keys, so every consumer subscripts the
+        same dict whatever the representation.
+
+        Args:
+            training: Training windows covering every evaluated horizon.
+            horizon: The horizon to estimate at.
+            grid_shape: Spatial grid shape, (height, width).
+
+        Returns:
+            The baseline report for this run's representation.
+        """
+        if self.value_range is None:
+            return self._categorical_baseline_at(training, horizon, grid_shape)
+        return self._continuous_baseline_at()
+
+    def _categorical_baseline_at(
+        self, training: WindowBatch, horizon: int, grid_shape: tuple[int, int]
+    ) -> dict:
+        """Fit the copy tables and the climatology floor at one horizon.
 
         Per horizon, from training windows only. Both estimates come from one
-        draw, so the floor and the denominator describe the same dataset.
+        draw, so the floor and the denominator describe the same dataset, and
+        neither is fitted on what it is scored on.
 
         Args:
             training: Training windows covering every evaluated horizon.
@@ -1003,6 +1132,30 @@ class EvaluateStage(ArmScopedStage):
             CLIMATOLOGY_KEY: float(
                 climatology_entropy(targets, grid_shape, classes)
             ),
+        }
+
+    @staticmethod
+    def _continuous_baseline_at() -> dict:
+        """Return the baseline report for a continuous representation.
+
+        The keys are absent by representation rather than missing. Each
+        one estimates a distribution over classes, and a continuous
+        representation has none: the tables hold a conditional over class
+        pairs, the smoothing report counts unseen class pairs, and the
+        climatology floor is an entropy over classes. Computing any of them on
+        continuous values would return a number that is not the quantity its
+        name promises.
+
+        The continuous copy fits nothing, so it is measured beside the model on
+        the windows being scored rather than estimated here.
+
+        Returns:
+            The same keys the categorical branch returns, each None.
+        """
+        return {
+            "tables": None,
+            SMOOTHING_KEY: None,
+            CLIMATOLOGY_KEY: None,
         }
 
     @staticmethod
@@ -1094,11 +1247,16 @@ class EvaluateStage(ArmScopedStage):
         included, at the grid actually scored: a different set of horizons
         produces a different file under the same name.
 
-        The validation pass's identity must stay as it is field for field, or
-        every sentinel already on disk goes stale. The test pass adds its split
-        and replaces `params_selection` with a marker, because it scores both
-        trees and refuses `--params`: an identity must not carry a flag its own
-        run rejects.
+        `representation` is the one field added since the identity was fixed,
+        and adding it marks every evaluate sentinel written before it stale.
+        That is why the backfill runs on a tree before this code reaches it,
+        never after: a backfilled field the code does not yet emit is inert,
+        and the reverse invalidates every sentinel at once.
+
+        Nothing else may be added without the same treatment. The test pass
+        adds its split and replaces `params_selection` with a marker, because
+        it scores both trees and refuses `--params`: an identity must not carry
+        a flag its own run rejects.
 
         Returns:
             JSON-serialisable identity fields.
@@ -1112,6 +1270,11 @@ class EvaluateStage(ArmScopedStage):
                 # Already a directory level. Included so a sentinel missing the
                 # field mismatches.
                 "arm": self.arm,
+                # Which error the numbers under this sentinel hold. Without it
+                # a run rescored under another representation matches the
+                # sentinel, skips, and leaves the previous numbers standing
+                # under the new label.
+                "representation": self.config.data.representation,
                 "total_steps": self.config.train.total_steps,
                 "probability_log_seed": self.config.eval.probability_log_seed,
                 "probability_log_dtype": self.config.eval.probability_log_dtype,
