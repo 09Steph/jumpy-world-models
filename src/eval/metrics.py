@@ -5,7 +5,6 @@ count comes from `len(logits)` and the grid from `grid_shape`.
 
 Observations arrive flattened, as `reconstruction_loss` takes them, and the
 decomposition comes from `observation_class_targets`.
-
 """
 
 from __future__ import annotations
@@ -14,7 +13,10 @@ import jax
 import jax.numpy as jnp
 
 from config import AGENT_CHANNEL_INDEX
-from src.models.losses import observation_class_targets
+from src.models.losses import (
+    observation_class_targets,
+    observation_pixel_targets,
+)
 
 MOVER_ACCURACY_KEY: str = "mover_restricted_accuracy"
 MOVER_CHANGED_CELLS_KEY: str = "mean_changed_cells"
@@ -33,13 +35,43 @@ def _predictions(logits: list[jax.Array]) -> list[jax.Array]:
     return [jnp.argmax(channel, axis=-1) for channel in logits]
 
 
+def _assert_one_array_per_channel(
+    logits: list[jax.Array], truth: jax.Array
+) -> None:
+    """Raise unless the prediction holds one array per observation channel.
+
+    A categorical prediction is one logits array per channel, so its last axis
+    is classes. A continuous prediction is a single array over all channels, so
+    its last axis is channels. Both are lists, and every metric here iterates
+    the list and argmaxes the last axis, so a continuous prediction reaching
+    one of them scores its channels as though they were classes of channel
+    zero and returns a plausible number.
+
+    Args:
+        logits: The prediction being scored.
+        truth: Class indices, shape (..., height, width, channels).
+
+    Raises:
+        ValueError: If the prediction does not hold one array per channel.
+    """
+    channels = int(truth.shape[-1])
+    if len(logits) == channels:
+        return
+    raise ValueError(
+        f"a categorical metric was given {len(logits)} prediction array(s) for "
+        f"an observation with {channels} channel(s). A continuous prediction "
+        f"is one array whose last axis is channels, not classes, and it has no "
+        f"categorical reading. Score it with model_mse instead."
+    )
+
+
 def _correct_mask(
     logits: list[jax.Array], targets: jax.Array, grid_shape: tuple[int, int]
 ) -> jax.Array:
     """Return a boolean array marking every correctly predicted cell-channel.
 
-    One place the comparison happens. per_cell_accuracy, exact_grid_match_rate
-    and mover_restricted_accuracy are three readings of this one array.
+    One place the comparison happens. The categorical metrics below are
+    readings of this one array.
 
     Args:
         logits: Per-channel logits, each (..., height, width, classes).
@@ -50,6 +82,7 @@ def _correct_mask(
         Boolean array of shape (..., height, width, channels).
     """
     truth = observation_class_targets(targets, grid_shape)
+    _assert_one_array_per_channel(logits, truth)
     stacked = jnp.stack(_predictions(logits), axis=-1)
     return stacked == truth
 
@@ -69,6 +102,10 @@ def per_cell_accuracy(
 
     Returns:
         Scalar accuracy over every cell, channel and example.
+
+    Raises:
+        ValueError: If given a continuous prediction, which has no
+            categorical reading.
     """
     return jnp.mean(_correct_mask(logits, targets, grid_shape).astype(jnp.float32))
 
@@ -88,6 +125,10 @@ def exact_grid_match_rate(
 
     Returns:
         Scalar rate over the batch.
+
+    Raises:
+        ValueError: If given a continuous prediction, which has no
+            categorical reading.
     """
     correct = _correct_mask(logits, targets, grid_shape)
     per_example = jnp.all(correct, axis=(-3, -2, -1))
@@ -112,6 +153,10 @@ def agent_position_accuracy(
 
     Returns:
         Scalar accuracy over the agent channel.
+
+    Raises:
+        ValueError: If given a continuous prediction, which has no
+            categorical reading.
     """
     correct = _correct_mask(logits, targets, grid_shape)
     return jnp.mean(correct[..., AGENT_CHANNEL_INDEX].astype(jnp.float32))
@@ -123,9 +168,9 @@ def model_cross_entropy(
     """Return mean per-cell cross-entropy, summed over channels.
 
     Mean per cell, where `reconstruction_loss` sums over them, so the value is
-    comparable across the two observation modes' different grid sizes. The same
-    quantity as `baselines.copy_cross_entropy`, asserted by a test feeding both
-    the same predictor.
+    comparable across observation modes' different grid sizes. The same
+    quantity as `baselines.copy_cross_entropy`, asserted by a test on one
+    predictor.
 
     Args:
         logits: Per-channel logits, each (batch, height, width, classes).
@@ -134,8 +179,13 @@ def model_cross_entropy(
 
     Returns:
         Scalar mean per-cell cross-entropy in nats, summed over channels.
+
+    Raises:
+        ValueError: If given a continuous prediction, which has no
+            categorical reading.
     """
     truth = observation_class_targets(targets, grid_shape)
+    _assert_one_array_per_channel(logits, truth)
     total = jnp.zeros(())
     for channel, channel_logits in enumerate(logits):
         log_probs = jax.nn.log_softmax(channel_logits, axis=-1)
@@ -144,6 +194,53 @@ def model_cross_entropy(
         )[..., 0]
         total = total - jnp.mean(picked)
     return total
+
+
+def mover_mask(
+    states: jax.Array, targets: jax.Array, grid_shape: tuple[int, int]
+) -> jax.Array:
+    """Return which cell-channels change between the start and end observation.
+
+    Ground truth only. No prediction is involved, so the mask is defined
+    wherever a start and an end observation exist.
+
+    Args:
+        states: Flattened start observations s_t, shape (batch, obs_dim).
+        targets: Flattened end observations s_{t+h}, same shape as states.
+        grid_shape: Spatial grid shape, (height, width).
+
+    Returns:
+        Boolean mask of shape (batch, height, width, channels).
+    """
+    start = observation_class_targets(states, grid_shape)
+    end = observation_class_targets(targets, grid_shape)
+    return start != end
+
+
+def model_mse(
+    prediction: jax.Array,
+    targets: jax.Array,
+    grid_shape: tuple[int, int],
+    value_range: tuple[int, int],
+) -> jax.Array:
+    """Return mean squared error per cell-channel on normalised values.
+
+    Mean, where `pixel_reconstruction_loss` sums, so the value is comparable
+    across grid sizes. The same quantity as `baselines.copy_mse`, asserted by a
+    test on one predictor.
+
+    Args:
+        prediction: Decoder output in [0, 1], shape
+            (batch, height, width, channels).
+        targets: Flattened end observations, shape (batch, obs_dim).
+        grid_shape: Spatial grid shape, (height, width).
+        value_range: Inclusive (low, high) bounds of the stored values.
+
+    Returns:
+        Scalar mean squared error on the [0, 1] scale.
+    """
+    truth = observation_pixel_targets(targets, grid_shape, value_range)
+    return jnp.mean((prediction - truth) ** 2)
 
 
 def mover_restricted_accuracy(
@@ -170,9 +267,7 @@ def mover_restricted_accuracy(
         MOVER_EXCLUDED_KEY. The accuracy is None when every example was
         excluded.
     """
-    start = observation_class_targets(states, grid_shape)
-    end = observation_class_targets(targets, grid_shape)
-    moved = start != end
+    moved = mover_mask(states, targets, grid_shape)
     correct = _correct_mask(logits, targets, grid_shape)
 
     per_example_moved = jnp.sum(moved, axis=(-3, -2, -1))

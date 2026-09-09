@@ -1,11 +1,19 @@
-"""The calibrated copy baseline and climatology."""
+"""The copy baselines and climatology.
+
+A discrete observation gets a calibrated copy, a smoothed transition table
+estimated on the training split. A continuous one gets the stationary copy
+itself, which has no table to calibrate.
+"""
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 
-from src.models.losses import observation_class_targets
+from src.models.losses import (
+    observation_class_targets,
+    observation_pixel_targets,
+)
 
 SMOOTHING_COUNT: float = 1.0
 
@@ -32,11 +40,8 @@ def copy_transition_counts(
             shape (batch, obs_dim).
         targets: Flattened end observations s_{t+h} for the same pairs, one
             horizon, same shape as states.
-        grid_shape: Spatial grid shape, (height, width). Read from config,
-            never a literal.
-        obs_channel_classes: Classes per channel, read from config. A
-            single-channel environment with thousands of classes is covered by
-            this signature unchanged.
+        grid_shape: Spatial grid shape, (height, width).
+        obs_channel_classes: Classes per channel.
 
     Returns:
         One (classes, classes) integer count array per channel, in channel
@@ -73,7 +78,7 @@ def calibrated_copy_tables(
     Args:
         states: Flattened start observations s_t from the training split only.
         targets: Flattened end observations s_{t+h} for the same pairs, one
-        horizon.
+            horizon.
         grid_shape: Spatial grid shape, (height, width).
         obs_channel_classes: Classes per channel.
 
@@ -102,8 +107,7 @@ def copy_cross_entropy(
     The same quantity as the model's. Both are mean per-cell categorical
     cross-entropy summed over channels, so the ratio compares like with like.
     If the two diverge in definition the skill score becomes meaningless
-    without anything failing, so a test feeds this and
-    `metrics.model_cross_entropy` the same predictor and asserts they agree.
+    without anything failing, so a test asserts they agree on one predictor.
 
     Args:
         tables: Row-normalised conditionals from calibrated_copy_tables,
@@ -124,11 +128,39 @@ def copy_cross_entropy(
     return total
 
 
+def copy_mse(
+    states: jax.Array,
+    targets: jax.Array,
+    grid_shape: tuple[int, int],
+    value_range: tuple[int, int],
+) -> jax.Array:
+    """Return the stationary copy's mean squared error on normalised values.
+
+    The same quantity as `metrics.model_mse`, so the ratio compares like with
+    like. The copy predicts the start observation unchanged and is left
+    uncalibrated. The pixel bar only has to be uniform across arms within one
+    representation, and comparison against the symbolic numbers is invalid
+    whatever the baseline does.
+
+    Args:
+        states: Flattened start observations of the windows being scored.
+        targets: Flattened end observations of the same windows.
+        grid_shape: Spatial grid shape, (height, width).
+        value_range: Inclusive (low, high) bounds of the stored values.
+
+    Returns:
+        Scalar mean squared error on the [0, 1] scale.
+    """
+    start = observation_pixel_targets(states, grid_shape, value_range)
+    end = observation_pixel_targets(targets, grid_shape, value_range)
+    return jnp.mean((start - end) ** 2)
+
+
 def smoothing_report(tables_counts: list[jax.Array]) -> dict:
     """Return, per channel, how many (c_prev, c_next) pairs had zero count.
 
-    Measures smoothing's reach. Per horizon and per channel. Channels with
-    different class counts have different numbers of pairs to fill.
+    Measures smoothing's reach. Channels with different class counts have
+    different numbers of pairs to fill.
 
     Args:
         tables_counts: Raw, unsmoothed counts from copy_transition_counts.
@@ -168,8 +200,8 @@ def climatology_entropy(
         obs_channel_classes: Classes per channel.
 
     Returns:
-        Scalar entropy in nats, summed over channels, directly comparable with
-        the two cross-entropies above.
+        Scalar entropy in nats, summed over channels, on the same scale as the
+        copy cross-entropy.
     """
     codes = observation_class_targets(targets, grid_shape)
     total = jnp.zeros(())
