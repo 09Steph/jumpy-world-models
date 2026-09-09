@@ -1,7 +1,4 @@
-"""Generic network building blocks shared by the models.
-
-Harvested from the pre-rescope tree on 2026-08-17, unchanged in behaviour.
-"""
+"""Generic network building blocks shared by the models."""
 from __future__ import annotations
 
 from typing import Callable
@@ -10,7 +7,12 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-# Named activations. A table, so an unknown name fails with a KeyError.
+# Re-exported, not used here. `src.models.encoder` and the tests import
+# `dilations_for_grid` and `receptive_field` from this module.
+from config import dilations_for_grid, receptive_field  # noqa: F401
+
+__all__ = ["dilations_for_grid", "receptive_field"]
+
 ACTIVATIONS: dict[str, Callable[[jax.Array], jax.Array]] = {
     "gelu": jax.nn.gelu,
     "silu": jax.nn.silu,
@@ -18,21 +20,14 @@ ACTIVATIONS: dict[str, Callable[[jax.Array], jax.Array]] = {
     "tanh": jnp.tanh,
 }
 
-# Output-layer kernel scaling. 1.0 is a no-op, 0.0 gives a zero kernel.
+# Output-layer kernel scaling.
 DECODER_OUTSCALE: float = 1.0
 
-# Convolution kernel size throughout every trunk.
 CONV_KERNEL: tuple[int, int] = (3, 3)
 
 
 def get_activation(name: str) -> Callable[[jax.Array], jax.Array]:
     """Look up a named activation function.
-
-    Args:
-        name: Activation name; one of "gelu", "silu", "relu", "tanh".
-
-    Returns:
-        The activation function.
 
     Raises:
         KeyError: If the name is not a known activation.
@@ -46,8 +41,7 @@ def output_kernel_init(outscale: float) -> Callable[..., jax.Array]:
     Applies to a component's final layer only, never its trunk.
 
     Args:
-        outscale: Multiplier on an already-initialised kernel. 1.0 is a no-op,
-            0.0 gives an exactly zero kernel.
+        outscale: Multiplier on an already-initialised kernel.
 
     Returns:
         A Flax kernel initialiser taking (key, shape, dtype).
@@ -71,9 +65,7 @@ def conv_trunk(
 ) -> jax.Array:
     """Shared convolution trunk: Conv, then RMSNorm, then activation, repeated.
 
-    Used by both the encoder and the convolutional decoder. Must be called
-    inside an @nn.compact __call__ so Flax scopes the layers to the calling
-    module.
+    Must be called inside an @nn.compact __call__.
 
     Args:
         features: Input feature grid, shape (batch, height, width, channels).
@@ -81,9 +73,7 @@ def conv_trunk(
         activation: Activation name, resolved by get_activation.
         norm_eps: RMSNorm epsilon.
         dilations: Dilation rate per layer, same length as ``channels``. None
-            leaves every layer undilated, the right default for a trunk that
-            expands from an already-global vector. A trunk that summarises a
-            grid needs dilation. See GridEncoder.
+            leaves every layer undilated.
 
     Returns:
         Feature grid of shape (batch, height, width, channels[-1]). SAME
@@ -113,52 +103,6 @@ def conv_trunk(
     return features
 
 
-def dilations_for_grid(grid_extent: int) -> tuple[int, ...]:
-    """Return the dilation schedule a grid of this size needs, and no more.
-
-    Doubling dilations until the receptive field spans the grid gives the
-    shallowest stack that can see the whole layout. A dilation wider than the
-    grid samples only zero padding.
-
-    Pass the largest grid the environment produces, not the current mode's, so
-    every observation mode shares one encoder shape.
-
-    Args:
-        grid_extent: The larger of the grid's height and width, for the largest
-            observation mode the environment emits.
-
-    Returns:
-        Doubling dilations, shortest schedule whose receptive field reaches
-        `grid_extent`.
-
-    Raises:
-        ValueError: If grid_extent is not positive.
-    """
-    if grid_extent < 1:
-        raise ValueError(f"grid_extent must be positive, got {grid_extent}")
-    dilations: list[int] = []
-    rate = 1
-    while receptive_field(tuple(dilations)) < grid_extent:
-        dilations.append(rate)
-        rate *= 2
-    return tuple(dilations)
-
-
-def receptive_field(dilations: tuple[int, ...]) -> int:
-    """Return the receptive field of a stack of 3x3 stride-1 convolutions.
-
-    Each layer adds ``2 * dilation`` to the span, giving
-    ``1 + 2 * sum(dilations)``.
-
-    Args:
-        dilations: Dilation rate per layer.
-
-    Returns:
-        Receptive field in cells, along one spatial axis.
-    """
-    return 1 + 2 * sum(dilations)
-
-
 def mlp_trunk(
     features: jax.Array,
     hidden_size: int,
@@ -168,13 +112,10 @@ def mlp_trunk(
 ) -> jax.Array:
     """Shared MLP trunk: Dense, then RMSNorm, then activation, repeated.
 
-    Must be called inside an @nn.compact __call__ so Flax scopes the layers to
-    the calling module.
+    Must be called inside an @nn.compact __call__.
 
     Args:
         features: Input features, shape (..., feature_dim).
-        hidden_size: Hidden width of each trunk layer.
-        layers: Number of trunk layers.
         activation: Activation name, resolved by get_activation.
         norm_eps: RMSNorm epsilon.
 

@@ -1,8 +1,9 @@
-"""Per-cell categorical decoders over a discrete observation grid.
+"""Decoders from a model embedding back to an observation grid.
 
-``GridDecoder`` and ``ConvGridDecoder`` emit per-channel logits for every cell.
-``OneTokenGridDecoder`` and ``PerCellGridDecoder`` adapt the transformer's
-readout to either tokenisation and return the same logits.
+``GridDecoder`` and ``ConvGridDecoder`` emit per-channel categorical logits for
+every cell. ``ConvPixelDecoder`` emits a continuous grid in [0, 1].
+``OneTokenGridDecoder``, ``PerCellGridDecoder`` and ``OneTokenPixelDecoder``
+adapt the transformer's readout to either tokenisation.
 """
 
 from __future__ import annotations
@@ -22,14 +23,11 @@ from src.models.layers import (
 class GridDecoder(nn.Module):
     """Reconstruction head emitting per-cell categorical logits.
 
-    One categorical distribution per grid cell per channel. The observations
-    hold discrete codes.
+    One categorical distribution per grid cell per channel, over discrete
+    codes.
 
     Must not revert to a regression loss. Mean squared error treats the codes
-    as ordinal, and under it the decoder collapsed to a near-constant, worse
-    than a repeat-the-last-observation baseline at every step.
-
-    Per-channel heads. The three channels have cardinalities 11, 6 and 4.
+    as ordinal.
 
     Attributes:
         obs_grid_shape: Spatial grid shape, (height, width).
@@ -89,9 +87,8 @@ class ConvGridDecoder(nn.Module):
     grid, adds a learned position, and convolves.
 
     Every convolution is grid-size independent and the positional parameters
-    are factorised into a row vector and a column vector, so the same decoder
-    serves the 19x19 top-down mode, the 7x7 egocentric mode and a 21x79
-    NetHack map. Without the learned positions every cell would decode
+    are factorised into a row vector and a column vector, so one decoder serves
+    any grid shape. Without the learned positions every cell would decode
     identically.
 
     Attributes:
@@ -122,15 +119,10 @@ class ConvGridDecoder(nn.Module):
         """
         height, width = self.obs_grid_shape
 
-        # Broadcast the single embedding to every cell, then add a learned
-        # per-cell vector so the positions are distinguishable.
         features = jnp.broadcast_to(
             embedding[:, None, None, :],
             (embedding.shape[0], height, width, embedding.shape[-1]),
         )
-        # Factorised into a row vector and a column vector, costing (H + W)*d
-        # against H*W*d. A distinct (row, column) pair still identifies every
-        # cell uniquely.
         rows = self.param(
             "row_position",
             nn.initializers.normal(stddev=0.02),
@@ -147,7 +139,6 @@ class ConvGridDecoder(nn.Module):
             features, self.channels, self.activation, self.norm_eps
         )
 
-        # One 1x1 convolution per channel, shared across every cell.
         return [
             nn.Conv(
                 features=num_classes,
@@ -159,11 +150,130 @@ class ConvGridDecoder(nn.Module):
         ]
 
 
+class ConvPixelDecoder(nn.Module):
+    """Expand one embedding back to a continuous grid, convolutionally.
+
+    The matched partner to PixelEncoder, sharing ConvGridDecoder's broadcast
+    and factorised positions. The output head is one 1x1 convolution over all
+    channels at once, ending in a sigmoid so the prediction lands in [0, 1].
+
+    Attributes:
+        obs_grid_shape: Spatial grid shape, (height, width).
+        num_channels: Channels in the predicted observation.
+        channels: Convolution widths, one per trunk layer.
+        activation: Activation name, resolved by layers.get_activation.
+        norm_eps: RMSNorm epsilon.
+    """
+
+    obs_grid_shape: tuple[int, int]
+    num_channels: int
+    channels: tuple[int, ...]
+    activation: str = "silu"
+    norm_eps: float = 1e-4
+
+    @nn.compact
+    def __call__(self, embedding: jax.Array) -> list[jax.Array]:
+        """Return the predicted grid, normalised to [0, 1].
+
+        One array in a list, matching the categorical decoders' return. The
+        last axis is channels here and classes there, and a consumer reads
+        which from the field spec rather than from the shape.
+
+        Args:
+            embedding: Model output for one prediction, shape
+                (batch, embedding_dim).
+
+        Returns:
+            One array of shape (batch, height, width, num_channels).
+        """
+        height, width = self.obs_grid_shape
+
+        features = jnp.broadcast_to(
+            embedding[:, None, None, :],
+            (embedding.shape[0], height, width, embedding.shape[-1]),
+        )
+        rows = self.param(
+            "row_position",
+            nn.initializers.normal(stddev=0.02),
+            (height, embedding.shape[-1]),
+        )
+        columns = self.param(
+            "column_position",
+            nn.initializers.normal(stddev=0.02),
+            (width, embedding.shape[-1]),
+        )
+        features = features + rows[None, :, None, :] + columns[None, None, :, :]
+
+        features = conv_trunk(
+            features, self.channels, self.activation, self.norm_eps
+        )
+        prediction = nn.Conv(
+            features=self.num_channels,
+            kernel_size=(1, 1),
+            kernel_init=output_kernel_init(DECODER_OUTSCALE),
+            name="pixels",
+        )(features)
+        return [nn.sigmoid(prediction)]
+
+
+class OneTokenPixelDecoder(nn.Module):
+    """Read a continuous prediction off a single state token.
+
+    The continuous counterpart to OneTokenGridDecoder.
+
+    Attributes:
+        obs_grid_shape: Spatial grid shape, (height, width).
+        num_channels: Channels in the predicted observation.
+        channels: Convolution widths of the expansion trunk.
+        activation: Activation name, resolved by layers.get_activation.
+        norm_eps: RMSNorm epsilon.
+    """
+
+    obs_grid_shape: tuple[int, int]
+    num_channels: int
+    channels: tuple[int, ...]
+    activation: str = "silu"
+    norm_eps: float = 1e-4
+
+    @nn.compact
+    def __call__(self, state_tokens: jax.Array) -> list[jax.Array]:
+        """Return the predicted grid, normalised to [0, 1].
+
+        Delegates to ConvPixelDecoder. Do not wrap the result again; that would
+        nest the list.
+
+        Args:
+            state_tokens: Transformer output at the state token's position,
+                shape (batch, 1, d_model).
+
+        Returns:
+            One array of shape (batch, height, width, num_channels).
+
+        Raises:
+            ValueError: If more than one state token is supplied, meaning the
+                model was built with per-cell tokenisation and this decoder.
+        """
+        if state_tokens.shape[1] != 1:
+            raise ValueError(
+                f"OneTokenPixelDecoder expects exactly one state token, got "
+                f"{state_tokens.shape[1]}. Per-cell tokenisation pairs with "
+                "PerCellGridDecoder."
+            )
+        return ConvPixelDecoder(
+            obs_grid_shape=self.obs_grid_shape,
+            num_channels=self.num_channels,
+            channels=self.channels,
+            activation=self.activation,
+            norm_eps=self.norm_eps,
+            name="grid",
+        )(state_tokens[:, 0, :])
+
+
 class OneTokenGridDecoder(nn.Module):
     """Read the prediction off a single state token and expand it to the grid.
 
-    The readout under one-token tokenisation. Both readout decoders take
-    (batch, num_tokens, d_model) and return the same logits shape.
+    The readout under one-token tokenisation. Readout decoders take
+    (batch, num_tokens, d_model).
 
     Attributes:
         obs_grid_shape: Spatial grid shape, (height, width).
@@ -218,12 +328,10 @@ class PerCellGridDecoder(nn.Module):
     into a grid and a shared 1x1 head scores every cell. No learned positional
     parameters. Position is carried by which token a cell's vector came from.
 
-    Returns the same logits shape as OneTokenGridDecoder.
-
     Attributes:
         obs_grid_shape: Spatial grid shape, (height, width).
         obs_channel_classes: Number of classes per observation channel.
-        channels: Convolution widths of the trunk. Undilated.
+        channels: Convolution widths of the trunk.
         activation: Activation name, resolved by layers.get_activation.
         norm_eps: RMSNorm epsilon.
     """

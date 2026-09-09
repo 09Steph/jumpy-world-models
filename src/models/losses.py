@@ -1,7 +1,10 @@
-"""Reconstruction loss and its observation-target helpers.
+"""Reconstruction losses and their observation-target helpers.
 
-Per-cell categorical cross-entropy over the three categorical observation
-channels.
+A discrete observation is scored by per-cell categorical cross-entropy. A
+continuous one is scored by squared error on values rescaled from their
+declared bounds to [0, 1]. Both sum over cells and channels rather than
+averaging, so both are totals per example, and the two are in different units
+and never comparable.
 """
 from __future__ import annotations
 
@@ -13,9 +16,7 @@ def observation_class_targets(
 ) -> jax.Array:
     """Reshape flattened observations into integer class indices on the grid.
 
-    Observations are stored as small integer codes and flattened to float for
-    the encoder. The values are exactly representable in float32, so the cast
-    back is lossless.
+    The cast truncates, so the stored values must be integral.
 
     Args:
         obs: Flattened observations, shape (..., obs_dim).
@@ -33,11 +34,10 @@ def reconstruction_loss(
 ) -> jax.Array:
     """Per-cell categorical cross-entropy, summed over cells and channels.
 
-    Summed, not averaged, so the value scales with the number of grid cells and
-    is much larger than a per-cell mean.
+    Summed, not averaged, so the value scales with the number of grid cells.
 
     Args:
-        logits: Per-channel logits from GridDecoder, each
+        logits: Per-channel logits from a grid decoder, each
             (..., height, width, classes).
         obs: Flattened observations, shape (..., obs_dim).
         grid_shape: Spatial grid shape, (height, width).
@@ -56,13 +56,84 @@ def reconstruction_loss(
     return total
 
 
+def observation_pixel_targets(
+    obs: jax.Array, grid_shape: tuple[int, int], value_range: tuple[int, int]
+) -> jax.Array:
+    """Reshape flattened observations onto the grid and normalise to [0, 1].
+
+    Args:
+        obs: Flattened observations, shape (..., obs_dim).
+        grid_shape: Spatial grid shape, (height, width).
+        value_range: Inclusive (low, high) bounds of the stored values.
+
+    Returns:
+        Normalised values, shape (..., height, width, channels).
+    """
+    low, high = value_range
+    height, width = grid_shape
+    grid = obs.reshape(*obs.shape[:-1], height, width, -1)
+    return (grid.astype(jnp.float32) - low) / (high - low)
+
+
+def pixel_reconstruction_loss(
+    prediction: jax.Array,
+    obs: jax.Array,
+    grid_shape: tuple[int, int],
+    value_range: tuple[int, int],
+) -> jax.Array:
+    """Squared error on normalised values, summed over cells and channels.
+
+    Summed, not averaged, matching reconstruction_loss.
+
+    Args:
+        prediction: Decoder output in [0, 1], shape
+            (..., height, width, channels).
+        obs: Flattened observations, shape (..., obs_dim).
+        grid_shape: Spatial grid shape, (height, width).
+        value_range: Inclusive (low, high) bounds of the stored values.
+
+    Returns:
+        Summed squared error per element, shape obs.shape[:-1].
+    """
+    targets = observation_pixel_targets(obs, grid_shape, value_range)
+    return jnp.sum((prediction - targets) ** 2, axis=(-3, -2, -1))
+
+
+def check_observation_values_in_bounds(
+    obs: jax.Array, grid_shape: tuple[int, int], value_range: tuple[int, int]
+) -> None:
+    """Raise if any observation value falls outside its declared bounds.
+
+    The continuous counterpart to check_observation_values_in_range. A host-side
+    check on a sampled batch, not inside a jitted step.
+
+    Args:
+        obs: Flattened observations, shape (..., obs_dim).
+        grid_shape: Spatial grid shape, (height, width).
+        value_range: Inclusive (low, high) bounds of the stored values.
+
+    Raises:
+        ValueError: If any value lies outside the declared bounds.
+    """
+    low, high = value_range
+    height, width = grid_shape
+    grid = obs.reshape(*obs.shape[:-1], height, width, -1)
+    lowest = float(jnp.min(grid))
+    highest = float(jnp.max(grid))
+    if lowest < low or highest > high:
+        raise ValueError(
+            f"observation holds values in [{lowest}, {highest}], outside the "
+            f"declared [{low}, {high}] range. See "
+            f"config.CONTINUOUS_VALUE_RANGES"
+        )
+
+
 def check_observation_values_in_range(
     obs: jax.Array, grid_shape: tuple[int, int], channel_classes: tuple[int, ...]
 ) -> None:
     """Raise if any observation code falls outside its channel's class range.
 
-    A host-side check on a sampled batch, not inside a jitted step. It costs
-    one host sync per call.
+    A host-side check on a sampled batch, not inside a jitted step.
 
     Args:
         obs: Flattened observations, shape (..., obs_dim).
