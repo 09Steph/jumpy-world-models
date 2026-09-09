@@ -31,8 +31,6 @@ logger = get_logger(__name__)
 
 SENTINEL_FILENAME: str = "done.json"
 
-# One over pylint's default. Every argument is a scoping, and collapsing them
-# into an object would hide them at the call sites.
 # pylint: disable=too-many-arguments,too-many-positional-arguments
 
 
@@ -98,7 +96,7 @@ def is_stage_done(
     env: str | None = None,
     arm: int | None = None,
 ) -> bool:
-    """Return whether a stage completed AND matches the identity it must have.
+    """Return whether a stage completed and matches the identity it must have.
 
     Identity and integrity, not file existence. Existence alone answers whether
     something finished here, which is not the question.
@@ -185,6 +183,48 @@ def stage_state(
         current_value,
     )
     return MANIFEST_STATE_STALE
+
+
+def read_stage_metadata(
+    stage: str,
+    run_name: str,
+    seed: int,
+    fast: bool = False,
+    env: str | None = None,
+    arm: int | None = None,
+) -> dict | None:
+    """Return a sentinel's recorded metadata, or None when it cannot be read.
+
+    Reading, not comparing. `stage_state` answers whether a sentinel matches an
+    identity; this answers what it recorded, which is what a caller needs
+    before it has an identity to compare against.
+
+    Args:
+        stage: Sentinel subdirectory.
+        run_name: The run this sentinel is scoped to.
+        seed: The artefact seed this sentinel is scoped to.
+        fast: Whether this is a prototype run.
+        env: Registered environment name.
+        arm: One of config.ARMS, or None for a stage every arm shares.
+
+    Returns:
+        The recorded metadata, or None when no sentinel exists or it is
+        unreadable. An unreadable sentinel is not an error here: the caller
+        asked what was recorded and the answer is that nothing legible was.
+    """
+    path = _sentinel_path(stage, run_name, seed, fast, env, arm)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("metadata", {})
+    except (json.JSONDecodeError, OSError) as error:
+        logger.warning(
+            "stage %s sentinel at %s is unreadable (%s)",
+            stage,
+            safe_rel(path),
+            error,
+        )
+        return None
 
 
 def mark_stage_done(

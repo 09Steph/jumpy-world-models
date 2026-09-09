@@ -67,23 +67,35 @@ def _assert_seeds_are_coupled(configs: Sequence[ExperimentConfig]) -> None:
             )
 
 
-def configs_for_datasets(config: ExperimentConfig) -> list[ExperimentConfig]:
-    """Derive one configuration per reporting seed, all three seeds equal.
+def configs_for_datasets(
+    config: ExperimentConfig, data_seeds: Sequence[int] = SEEDS
+) -> list[ExperimentConfig]:
+    """Derive one configuration per reporting seed, with the seed fields equal.
 
     One independently generated dataset per seed. Seeds drawing from a shared
     dataset are not independent replications, and intervals over them would be
-    conditional on that single draw. Holding `model_seed` fixed resolves every
-    dataset to one checkpoint directory.
+    conditional on that single draw. Holding `model_seed` fixed instead would
+    resolve every dataset to one checkpoint directory.
 
     The attribution arm pins `data_seed` and varies `model_seed`, and does not
     come through here.
 
+    `data_seeds` selects which reporting seeds one invocation covers, so an
+    experiment whose datasets do not fit on disk together runs in waves. It
+    never introduces a seed SEEDS does not hold, and it reaches no sentinel
+    identity, so a subset run writes what a full run writes for those seeds.
+
+    Args:
+        config: The base configuration built from the command line.
+        data_seeds: Which reporting seeds this invocation covers.
+
     Returns:
-        One configuration per entry in SEEDS, in order.
+        One configuration per named seed, in SEEDS order.
 
     Raises:
-        ValueError: If SEEDS holds duplicates, or if any derived configuration
-            leaves the two seeds uncoupled.
+        ValueError: If SEEDS holds duplicates, if data_seeds is empty, names a
+            seed twice or names one outside SEEDS, or if any derived
+            configuration leaves the two seeds uncoupled.
     """
     if len(set(SEEDS)) != len(SEEDS):
         raise ValueError(
@@ -91,6 +103,7 @@ def configs_for_datasets(config: ExperimentConfig) -> list[ExperimentConfig]:
             "directory and one sentinel, and the second would report complete "
             "without having been generated"
         )
+    selected = _resolve_data_seeds(data_seeds)
     # Set model_seed explicitly. __post_init__ resolves at construction and
     # replace() would carry the old value forward. Do not build a fresh
     # ExperimentConfig here, which discards every CLI override already applied.
@@ -98,10 +111,44 @@ def configs_for_datasets(config: ExperimentConfig) -> list[ExperimentConfig]:
         replace(
             config, seed=data_seed, data_seed=data_seed, model_seed=data_seed
         )
-        for data_seed in SEEDS
+        for data_seed in selected
     ]
     _assert_seeds_are_coupled(seed_configs)
     return seed_configs
+
+
+def _resolve_data_seeds(data_seeds: Sequence[int]) -> list[int]:
+    """Return the named reporting seeds in SEEDS order.
+
+    Args:
+        data_seeds: Which reporting seeds one invocation covers.
+
+    Returns:
+        The named seeds, ordered by SEEDS rather than by how they were named.
+
+    Raises:
+        ValueError: If data_seeds is empty, names a seed twice, or names one
+            SEEDS does not hold.
+    """
+    if not data_seeds:
+        raise ValueError(
+            "data seeds names no seed: a run covering no seed would report "
+            "success having generated nothing"
+        )
+    if len(set(data_seeds)) != len(data_seeds):
+        raise ValueError(
+            f"data seeds {list(data_seeds)} names a seed twice: the repeat "
+            "would resolve to one directory and one sentinel"
+        )
+    outside = sorted(set(data_seeds) - set(SEEDS))
+    if outside:
+        raise ValueError(
+            f"data seeds {outside} are not in SEEDS {list(SEEDS)}: a subset "
+            "selects which reporting seeds an invocation covers and cannot "
+            "introduce one, which would file a reported cell outside the "
+            "protocol"
+        )
+    return [seed for seed in SEEDS if seed in set(data_seeds)]
 
 
 def build_stages(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -168,6 +215,7 @@ def run_pipeline(  # pylint: disable=too-many-arguments,too-many-positional-argu
     stages: Sequence[str] | None = None,
     split: SplitName = SplitName.VALIDATION,
     source_run: str | None = None,
+    data_seeds: Sequence[int] = SEEDS,
 ) -> None:
     """Execute every stage of every dataset, aggregate, then write the manifest.
 
@@ -185,12 +233,13 @@ def run_pipeline(  # pylint: disable=too-many-arguments,too-many-positional-argu
             the environment declares.
         split: Which split evaluation scores.
         source_run: Run evaluation reads shards and checkpoints from.
+        data_seeds: Which reporting seeds this invocation covers.
 
     Raises:
         ValueError: If the arm is unknown, if a requested stage name is not
-            selectable, or if the selection matches no stage for this
-            environment. The first two are raised before any stage is
-            constructed.
+            selectable, if data_seeds is not a subset of SEEDS, or if the
+            selection matches no stage for this environment. The first two are
+            raised before any stage is constructed.
         Exception: Anything a stage raises, re-raised after the summary and
             the manifest have been written.
     """
@@ -201,7 +250,7 @@ def run_pipeline(  # pylint: disable=too-many-arguments,too-many-positional-argu
         raise ValueError(
             f"unknown stage(s) {unknown}, expected some of {SELECTABLE_STAGES}"
         )
-    seed_configs = configs_for_datasets(config)
+    seed_configs = configs_for_datasets(config, data_seeds)
     built: list[Stage] = []
     for seed_config in seed_configs:
         built.extend(
@@ -216,12 +265,14 @@ def run_pipeline(  # pylint: disable=too-many-arguments,too-many-positional-argu
             "would report success having done nothing."
         )
     logger.info(RUN_START_BANNER, config.run_name, config.seed, len(built))
+    # The seeds this invocation covers, not SEEDS, so a wave-run reads as the
+    # subset it is and the waves can be reconstructed from the logs alone.
     logger.info(
         "%d datasets x %d stages, data seeds %s, observation mode %s, arm %d, "
         "split %s",
         len(seed_configs),
         len(built) // len(seed_configs),
-        list(SEEDS),
+        [seed_config.data_seed for seed_config in seed_configs],
         config.sampler.observation_mode,
         arm,
         split.value,
