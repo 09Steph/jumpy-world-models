@@ -1,10 +1,7 @@
 """Training stage. Trains whichever arm it is built for.
 
-The arm is a constructor argument. Arms 2 and 3 share an architecture and
-differ only in the horizon their batches are drawn at, arm 2 at the sampled
-range and arm 3 at h = 1.
-
-No metric and no baseline. Those belong to evaluation.
+Arms 2 and 3 share an architecture and differ only in the horizons their
+batches are drawn at, arm 2 over the sampled range and arm 3 at h = 1.
 """
 
 # pylint: disable=too-many-lines
@@ -28,16 +25,14 @@ from config import (
     ARM_AR_ONE_STEP,
     ARM_DIRECT,
     ARMS,
+    CONTINUOUS_VALUE_RANGES,
     ENV_FAMILY_NAVIX,
-    ENV_FAMILY_NLE,
-    OBS_VALUE_RANGE_RGB,
-    OFFLINE_SOURCE,
-    REPRESENTATION_RGB,
     ExperimentConfig,
     SamplerMode,
     assert_config_resolved,
     checkpoints_dir,
     env_family,
+    offline_source_for_env,
 )
 from src.data.offline_sources import build_offline_source
 from src.data.split import (
@@ -104,19 +99,15 @@ ONE_STEP_HORIZON: int = 1
 class TrainedState:
     """Everything one training run carries between steps and into the payload.
 
-    A dataclass. `params` and `best_params` share a structure and dtype, so a
-    transposed pair would pass every shape assertion.
-
     Attributes:
         params: The last step's parameters. The resume point.
         opt_state: The last step's optimiser state, describing `params` alone.
         step: Gradient steps completed.
-        best_params: Parameters from the lowest loss observed, sampled at the
-            logging interval.
-        best_loss: The held-out loss at those parameters, not the training one.
+        best_params: Parameters from the lowest validation loss observed,
+            sampled at the logging interval.
+        best_loss: The validation loss at those parameters.
         best_step: The step it came from.
-        total_steps: The budget this run was scheduled for. A checkpoint
-            resumed under a different one is not the checkpoint it claims.
+        total_steps: The budget this run was scheduled for.
     """
 
     params: dict
@@ -132,8 +123,7 @@ class TrainedState:
 class IntervalTimer:
     """Wall-clock bookkeeping for the training loop's progress lines.
 
-    The interval is reset by `split`, not by the caller. Resetting in two
-    places double-counts an interval and understates the rate.
+    Only `split` resets the interval.
 
     Attributes:
         run_started_at: `perf_counter` at the first step of this invocation.
@@ -179,15 +169,14 @@ class IntervalTimer:
 
 
 def checkpoint_template(state: TrainedState) -> dict:
-    """Return the checkpoint payload for a state, or a restore template for one.
+    """Return the checkpoint payload for a state, used for both save and restore.
 
-    One definition of the payload shape, serving both save and restore. Orbax
-    matches a restore against the template it is given, so a hand-written copy
-    fails by loading plausible wrong weights.
+    Orbax restores into whatever template it is given, so a second payload
+    that drifts by a key loads plausible wrong weights.
 
     Args:
-        state: The state to persist, or a zero-filled one of the right
-            structure to restore into.
+        state: The state to persist, or one of the right structure to restore
+            into.
 
     Returns:
         The JAX pytree written to and read from the checkpoint directory.
@@ -213,14 +202,11 @@ def checkpoint_template(state: TrainedState) -> dict:
 def restore_target(params: dict, opt_state, total_steps: int) -> dict:
     """Return the template a restore reads a checkpoint into.
 
-    A zero-filled state of the right structure. Orbax matches against the
-    template it is given, not against what is on disk.
-
     Args:
         params: A freshly initialised parameter tree of the right shape.
         opt_state: An optimiser state built from that tree.
-        total_steps: The budget this run asks for, compared against the one
-            recorded in the checkpoint.
+        total_steps: The budget placed in the template. Nothing here compares
+            it with the checkpoint's.
 
     Returns:
         The restore template.
@@ -251,16 +237,15 @@ def count_parameters(params: dict) -> int:
 
 
 def save_checkpoint(directory: Path, state: dict) -> None:
-    """Write params, optimiser state and step, and wait for the write.
+    """Write the payload and wait for the asynchronous save to finish.
 
-    The save is asynchronous, so `wait_until_finished()` is not optional, and
-    `force=True` is needed to overwrite. Retention keeps exactly one checkpoint,
-    so a corrupted mid-write leaves nothing to fall back to.
+    `force=True` overwrites the only copy, so an interrupted write leaves no
+    checkpoint to fall back to.
 
     Args:
-        directory: Where the checkpoint tree is written. Created if absent.
-        state: The payload, carrying params, optimiser state, step and
-            CHECKPOINT_SCHEMA_KEY.
+        directory: Where the checkpoint tree is written. Its parent is created
+            if absent.
+        state: The payload from `checkpoint_template`.
     """
     ensure_dir(directory.parent)
     checkpointer = ocp.StandardCheckpointer()
@@ -289,9 +274,10 @@ def restore_checkpoint(directory: Path, target: dict) -> dict:
 def build_training_source(config: ExperimentConfig):
     """Return the trajectory source the configured environment is described by.
 
-    The model builder needs the source only for its spec. The live NAVIX source
-    is constructed here; an offline family delegates to build_offline_source,
-    which owns the one table mapping a corpus name to its reader.
+    The model builder reads only its spec. An offline environment resolves its
+    corpus through `offline_source_for_env`, as the offline generate stage
+    does. Building an Atari source needs the archive on disk, so training or
+    evaluating an Atari model does too.
 
     Args:
         config: The composed experiment configuration.
@@ -300,8 +286,9 @@ def build_training_source(config: ExperimentConfig):
         A source answering spec(observation_mode).
 
     Raises:
-        ValueError: If the environment's family has no source. env_family
-            raises first for an environment matching no declared prefix.
+        ValueError: If the environment matches no family prefix, or its family
+            registers no offline corpus.
+        FileNotFoundError: If an Atari archive shard is absent.
     """
     family = env_family(config.env.name)
     if family == ENV_FAMILY_NAVIX:
@@ -310,14 +297,8 @@ def build_training_source(config: ExperimentConfig):
             representation=config.data.representation,
             stored_modes=config.data.modes_stored(),
         )
-    if family == ENV_FAMILY_NLE:
-        source, _ = build_offline_source(OFFLINE_SOURCE)
-        return source
-    raise ValueError(
-        f"no trajectory source is wired for environment family '{family}'. "
-        f"Add one to build_training_source rather than letting the NAVIX "
-        f"source describe another family's observation."
-    )
+    source, _ = build_offline_source(offline_source_for_env(config.env.name))
+    return source
 
 
 def build_arm(
@@ -325,11 +306,9 @@ def build_arm(
 ):
     """Construct one arm for one observation mode and initialise its parameters.
 
-    One builder for every arm, so the matched parameter budget holds by
-    construction. Module-level because the evaluator restores this stage's
-    checkpoint against a template and has to build a structurally identical
-    model. The configured extent fixes encoder depth at the value every mode
-    shares.
+    Every arm is built from the same ModelConfig. Encoder depth follows the
+    configured extent, not the observed grid, so every mode shares it. The
+    evaluator rebuilds the model through this function to restore a checkpoint.
 
     Args:
         config: The composed experiment configuration.
@@ -380,15 +359,12 @@ def build_arm(
 
 
 class TrainStage(ArmScopedStage):
-    """Train one arm on real data and decode a prediction.
+    """Train one arm on real data.
 
     Reads this dataset's shards, re-derives its partition, draws training
-    windows, and steps the optimiser for the configured budget. Ends by
-    decoding one prediction and writing one checkpoint.
-
-    Model-seed derived. The arm is an instance attribute shadowing `Stage.arm`,
-    reaching the checkpoint directory, the metrics directory and the sentinel
-    through `arm_root`.
+    windows, steps the optimiser for the configured budget, decodes one
+    demonstration prediction and writes the final checkpoint. Its checkpoint,
+    metrics and sentinel directories are scoped by model seed and arm.
 
     Attributes:
         store: The trajectory store this stage reads through.
@@ -400,14 +376,9 @@ class TrainStage(ArmScopedStage):
 
     @property
     def checkpoint_dir(self) -> Path:
-        """Return this run's checkpoint directory, scoped by mode.
+        """Return this run's checkpoint directory.
 
-        Keyed on the model seed through `artefact_seed`, and on the observation
-        mode. Two modes of one run would otherwise write to one directory with
-        no warning.
-
-        Returns:
-            The directory `save_checkpoint` writes into.
+        Keyed on the model seed, the observation mode and the arm.
         """
         return checkpoints_dir(
             self.config.run_name,
@@ -466,18 +437,16 @@ class TrainStage(ArmScopedStage):
     def training_config(self) -> ExperimentConfig:
         """Return the configuration this arm's training sampler is built from.
 
-        A local derivation, not a change to `self.config`, which every artefact
-        records. Arm 3 trains at h = 1 and is evaluated across the full grid by
-        rolling out. OFFLINE is refused: the train-window filename carries
-        neither the horizon range nor the arm, so arm 3's one-step pool and the
-        mixed-horizon pool resolve to one file.
+        A local copy, never written back to `self.config`, which every artefact
+        records. Arm 3's copy is narrowed to h = 1.
 
         Returns:
             `self.config` for arms 1 and 2, and a copy narrowed to h = 1 for
             arm 3.
 
         Raises:
-            ValueError: If arm 3 is run under SamplerMode.OFFLINE.
+            ValueError: If arm 3 is run under SamplerMode.OFFLINE, whose pool
+                file cannot tell arm 3's pool from the mixed-horizon one.
         """
         if self.arm != ARM_AR_ONE_STEP:
             return self.config
@@ -505,8 +474,7 @@ class TrainStage(ArmScopedStage):
         sampler = WindowSampler.from_config(
             self.training_config, trajectories, split, SplitName.TRAIN
         )
-        # From `training_config`, as the train sampler is. Arm 3 trains at
-        # h = 1, so the full range would measure a horizon mismatch.
+        # From `training_config`, so arm 3's validation batch is at h = 1 too.
         validation_batch = WindowSampler.from_config(
             self.training_config, trajectories, split, SplitName.VALIDATION
         ).next_batch(
@@ -539,10 +507,9 @@ class TrainStage(ArmScopedStage):
             signal.signal(signal.SIGINT, previous_int)
 
     def _request_graceful_stop(self, signum: int, frame: object) -> None:
-        """Ask the training loop to stop at the end of the current step.
+        """Ask the training loop to stop after the current step.
 
-        Sets a flag and returns. Raising from a handler lands wherever the
-        interpreter happened to be, which may be inside a compiled step.
+        Only sets a flag, so the handler never raises inside a compiled step.
 
         Args:
             signum: The delivered signal number.
@@ -568,16 +535,18 @@ class TrainStage(ArmScopedStage):
         return self.store.read_dataset(self.dataset_dir, "training")
 
     def _partition(self, trajectories: list[Trajectory]) -> TrajectorySplit:
-        """Re-derive this dataset's three-way partition.
+        """Re-derive this dataset's partition by trajectory index.
 
-        Re-derived through the same call the preparation stage makes, so the
-        two cannot drift. The provenance file is for a reader, not an input.
+        Uses the preparation stage's call. The recorded split file is not read
+        or compared, so shards regenerated in a different order are split
+        differently from the recorded partition, and nothing raises.
 
         Args:
             trajectories: Every episode in this dataset, in store order.
 
         Returns:
-            The partition, identical to the recorded one.
+            The partition, identical to the recorded one while the shards are
+            unchanged.
         """
         return split_from_config(
             self.config, [len(trajectory) for trajectory in trajectories]
@@ -592,16 +561,17 @@ class TrainStage(ArmScopedStage):
         return build_arm(self.config, self.observation_mode, arm=self.arm)
 
     @property
-    def _value_range(self) -> tuple[int, int] | None:
+    def value_range(self) -> tuple[int, int] | None:
         """Return the stored-value bounds this arm trains against.
+
+        Read from CONTINUOUS_VALUE_RANGES, as the generate and evaluate stages
+        read it.
 
         Returns:
             The bounds for a continuous representation, None for a discrete
             one, which selects the categorical loss instead.
         """
-        if self.config.data.representation == REPRESENTATION_RGB:
-            return OBS_VALUE_RANGE_RGB
-        return None
+        return CONTINUOUS_VALUE_RANGES.get(self.config.data.representation)
 
     @property
     def _training_method(self):
@@ -635,12 +605,10 @@ class TrainStage(ArmScopedStage):
         """Return the mean endpoint reconstruction loss over one batch.
 
         The endpoint is the only supervised state, and one loss serves every
-        arm. A discrete representation is scored by categorical cross-entropy
-        and a continuous one by squared error. Arm 3's one-step objective is
-        this loss on batches drawn at h = 1, where the endpoint is the next
-        state. Mean over the batch, sum over cells, so the value scales with
-        grid size and is not comparable across observation modes without
-        normalisation.
+        arm: categorical cross-entropy for a discrete representation, squared
+        error for a continuous one. Arm 3's one-step objective is this loss on
+        batches drawn at h = 1. Mean over the batch and summed over cells and
+        channels, so the value scales with grid size.
 
         Args:
             model: The unbound transformer.
@@ -668,13 +636,13 @@ class TrainStage(ArmScopedStage):
             method=self._training_method,
         )
         flat = targets.reshape(targets.shape[0], -1)
-        if self._value_range is not None:
-            # The decoder returns one array in a list for every representation.
-            # A continuous prediction is that single array, whose last axis is
-            # channels rather than classes, so it is taken rather than iterated.
+        if self.value_range is not None:
+            # The decoder returns a list for every representation. A continuous
+            # prediction is its single element, whose last axis is channels
+            # rather than classes.
             return jnp.mean(
                 pixel_reconstruction_loss(
-                    logits[0], flat, targets.shape[1:3], self._value_range
+                    logits[0], flat, targets.shape[1:3], self.value_range
                 )
             )
         return jnp.mean(
@@ -690,12 +658,11 @@ class TrainStage(ArmScopedStage):
     ) -> TrainedState:
         """Run the gradient loop and return the trained state.
 
-        The observation-domain check runs once, on the first batch. Each step's
-        key is folded from the step number, so a resumed run draws the same
-        sequence as an uninterrupted one. Both losses are taken at the pre-update
-        parameters, the best model is sampled at the logging interval, and the
-        validation batch is drawn once and held through `next_batch`. The first
-        timing interval includes compilation.
+        The observation-domain check runs on this invocation's first batch.
+        Each step's key is folded from the step number, so a resumed run draws
+        the same batches as an uninterrupted one. Both losses are taken at the
+        pre-update parameters, the best model is sampled at the logging
+        interval, and the first timing interval includes compilation.
 
         Args:
             model: The unbound model for this arm.
@@ -794,12 +761,9 @@ class TrainStage(ArmScopedStage):
     def _compiled_step(self, model, optimiser):
         """Return a `jax.jit`-compiled full training step for this arm.
 
-        The batch is unpacked to arrays at the boundary. `WindowBatch` is a
-        frozen dataclass, not a pytree, and cannot cross `jit`. `model` is
-        closed over, so it compiles once, and the optimiser update stays inside
-        the boundary. Compilation changes operation fusion, so results shift
-        bitwise against the uncompiled path and a reporting set must come from
-        one code path.
+        The batch crosses the boundary as arrays and the optimiser update runs
+        inside it. Compiled results differ bitwise from the uncompiled path, so
+        a reporting set must come from one code path.
 
         Args:
             model: The unbound model for this arm.
@@ -834,8 +798,8 @@ class TrainStage(ArmScopedStage):
     def _compiled_validation(self, model):
         """Return a compiled, dropout-free loss for the validation batch.
 
-        Shares `_loss` with the training path. Two definitions is how a gap
-        stops measuring what is being optimised.
+        Must share `_loss` with the training step, or the gap stops comparing
+        like with like.
 
         Args:
             model: The unbound model for this arm.
@@ -921,11 +885,10 @@ class TrainStage(ArmScopedStage):
         )
 
     def _validation_loss(self, params, batch: WindowBatch) -> float:
-        """Return the held-out loss at these parameters, dropout off.
+        """Return the loss on the fixed validation batch, dropout off.
 
-        A training diagnostic, not a reported result. One fixed batch of the
-        validation split, so it says whether the run is overfitting and nothing
-        more. Reported numbers come from the evaluation stage.
+        Not a reported result, but it selects `best_params`, which evaluation
+        scores by default.
 
         Args:
             params: The parameter tree to score, pre-update.
@@ -958,11 +921,8 @@ class TrainStage(ArmScopedStage):
     ) -> None:
         """Emit one progress line and the projected finish time.
 
-        The gap is signed: positive is validation above training, negative
-        usually means dropout is costing the training number. The ETA comes from
-        the most recent interval. `elapsed` and `eta` are per seed and reset
-        between them, which is why the line names its seed, and the cumulative
-        figure is the runner's closing summary.
+        The gap is validation minus training. The ETA extrapolates the latest
+        interval, and elapsed and ETA cover this invocation only.
 
         Args:
             completed: Gradient steps completed.
@@ -993,8 +953,9 @@ class TrainStage(ArmScopedStage):
     def _draw(self, sampler: WindowSampler, base_key, step: int):
         """Return this step's training batch and its dropout key.
 
-        The key is folded from the step number, making it a function of the
-        seed and N alone, so a resumed run and a clean one match bitwise.
+        Both are folded from the model seed and the step number, so a resumed
+        run draws what an uninterrupted one would. GPU training is still not
+        bit-identical across runs.
 
         Args:
             sampler: The train-split sampler.
@@ -1019,9 +980,8 @@ class TrainStage(ArmScopedStage):
     ) -> TrainedState:
         """Record one completed update, then fold in best-model tracking.
 
-        Selection is on the validation loss, never the training loss, which
-        falls monotonically under overfitting and would track the final
-        parameters. The scored parameters are `state.params`, before the update.
+        Selection reads the validation loss at `state.params`, before the
+        update.
 
         Args:
             state: The state before this step's update.
@@ -1070,10 +1030,10 @@ class TrainStage(ArmScopedStage):
     def _resume_or_start(self, fresh: TrainedState) -> TrainedState:
         """Continue an interrupted run, or start clean.
 
-        Resumption is never a skip. The sentinel decides what runs, so a
-        checkpoint recording a complete run is ignored and the run starts over.
-        A schema mismatch raises, orbax being willing to match an older payload
-        wherever the structures coincide, and so does a changed budget.
+        A checkpoint recording a complete run is ignored and training starts
+        over. A different schema version or budget raises. Nothing else is
+        compared, so an incomplete checkpoint resumes under a changed learning
+        rate, batch size or other setting.
 
         Args:
             fresh: The state a clean run would start from.
@@ -1133,12 +1093,10 @@ class TrainStage(ArmScopedStage):
         )
 
     def _check_observation_domain(self, batch: WindowBatch) -> None:
-        """Raise if any observation falls outside its declared domain.
+        """Raise if any value in the first batch falls outside its declared domain.
 
-        Once on the first batch. A discrete observation is checked against its
-        class counts, a continuous one against its stored bounds. An
-        out-of-range value scores meaninglessly instead of raising, and it is a
-        dataset property.
+        Class counts bound a discrete observation and stored bounds a
+        continuous one. Only this invocation's first batch is checked.
 
         Args:
             batch: The first training batch drawn this run.
@@ -1147,9 +1105,9 @@ class TrainStage(ArmScopedStage):
             ValueError: If any value is outside the declared domain.
         """
         flat = batch.targets.reshape(batch.targets.shape[0], -1)
-        if self._value_range is not None:
+        if self.value_range is not None:
             check_observation_values_in_bounds(
-                flat, batch.targets.shape[1:3], self._value_range
+                flat, batch.targets.shape[1:3], self.value_range
             )
             return
         check_observation_values_in_range(
@@ -1157,11 +1115,10 @@ class TrainStage(ArmScopedStage):
         )
 
     def _decode_one_prediction(self, model, params, sampler: WindowSampler) -> None:
-        """Decode one batch and log what came back.
+        """Decode one training batch and log the per-channel agreement.
 
-        The accuracy logged here is not a result and must not be quoted. It is
-        measured on training windows with no baseline beside it, where a model
-        that only copies its input scores close to one.
+        A log line, never a result. It has no baseline, a copying model scores
+        close to one, and on a continuous representation it is meaningless.
 
         Args:
             model: The unbound transformer.
@@ -1186,9 +1143,9 @@ class TrainStage(ArmScopedStage):
     def _write_checkpoint(self, state: TrainedState) -> None:
         """Save the trained state and record the parameter budget beside it.
 
-        The best model is recorded, not substituted. The params key holds the
-        final parameters and the evaluation stage scores those, so a run ending
-        on a loss spike stays recoverable without retraining.
+        The payload holds both the final and the best parameters. Evaluation
+        scores `EvalConfig.params_selection`, the best tree by default, and the
+        test pass scores both.
 
         Args:
             state: The state to persist.
@@ -1220,16 +1177,12 @@ class TrainStage(ArmScopedStage):
     def sentinel_identity(self) -> dict:
         """Return the identity guarding this run's trained model.
 
-        Every field changes the weights and leaves the path alone, which is
-        the case the identity check exists for.
-
-        `completed_steps` is what makes an interrupted run refuse to be
-        skipped. Before training it reports the full budget, after training
-        what happened, and the stage re-reads this once `run()` returns.
-
-        Absent: the checkpoint interval and the rematerialisation flag. The
-        interval does not touch the weights, and remat changes how the gradient
-        is computed rather than what it is.
+        `completed_steps` reports the full budget before training and the steps
+        actually taken after it, so an interrupted run's sentinel does not
+        match the next invocation. The identity is not exhaustive. Among what
+        it omits are `horizon_min`, `dropout_rate`, `remat_rollout`, the
+        checkpoint interval and every dataset setting, so a change to one of
+        those under the same run name skips training and reuses the old model.
 
         Returns:
             JSON-serialisable identity fields.

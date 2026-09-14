@@ -1,13 +1,10 @@
 """Cross-seed aggregation of one run's per-seed artefacts.
 
-Combines the reporting seeds of one ``run_name`` into a single
-``aggregate_arm<n>.json`` carrying mean, sample standard deviation and the
-interquartile mean with a bootstrap confidence interval. Aggregation is per
-horizon, across seeds, over the metric names in
-``src/pipeline/metrics_schema.py``.
-
-Not a ``Stage`` subclass. The auto-trigger skips a missing seed and the CLI
-raises.
+Combines the reporting seeds of one run and arm into ``aggregate_arm<n>.json``,
+carrying the mean, the sample standard deviation and the interquartile mean
+with a bootstrap confidence interval, per horizon and across seeds, for the
+metrics the per-seed artefacts carry. The runner's auto-trigger skips an
+incomplete series and the CLI raises.
 """
 
 # pylint: disable=too-many-lines
@@ -42,8 +39,11 @@ from src.pipeline.aggregate_stats import (
     sample_std,
 )
 from src.pipeline.metrics_schema import (
+    COPY_MOVER_MSE_KEY,
     ERROR_METRIC_CROSS_ENTROPY,
     ERROR_METRIC_KEY,
+    MOVER_MSE_KEY,
+    MOVER_MSE_SKILL_KEY,
     PER_HORIZON_FINAL_STEP_KEY,
     PER_HORIZON_GAP_KEY,
     PER_HORIZON_KEY,
@@ -57,9 +57,8 @@ from src.utils.paths import safe_rel
 
 logger = get_logger(__name__)
 
-# Filename for the cross-seed artefact. It carries the arm; every arm would
-# otherwise resolve to one file. The observation mode stays a key inside the
-# payload, and only the arm is a directory level.
+# Filename for one arm's cross-seed artefact. The observation mode is a key
+# inside it.
 AGGREGATE_TEMPLATE: str = "aggregate_arm{arm}.json"
 
 AGGREGATE_FILENAME: str = AGGREGATE_TEMPLATE.format(arm=ARM_DIRECT)
@@ -67,11 +66,7 @@ AGGREGATE_FILENAME: str = AGGREGATE_TEMPLATE.format(arm=ARM_DIRECT)
 def required_per_horizon_keys(error_metric: str) -> tuple[str, ...]:
     """Return the per-horizon keys a run under one metric must carry.
 
-    Resolved from the metric the artefact declares, so a rename in
-    metrics_schema breaks this import rather than producing an empty series,
-    and a run scored under one metric is never required to carry the other's
-    key. The rest of the block's metrics are discovered, so adding one to the
-    writer needs no edit here and removing one fails loudly.
+    Every other metric is discovered from the artefact rather than required.
 
     Args:
         error_metric: The value the artefact declares under ERROR_METRIC_KEY.
@@ -86,22 +81,26 @@ def required_per_horizon_keys(error_metric: str) -> tuple[str, ...]:
         WINDOWS_KEY,
     )
 
-# Written into every mode's block so a reader can see the check ran. Non-empty
-# is a refusal, not a report.
+# Written empty into every mode's block. An undefined per-horizon metric raises
+# or is recorded as None under its own name instead.
 OMITTED_METRICS_KEY: str = "omitted_metrics"
 
 # Suffix for the per-horizon window count, which is reported as a range.
 WINDOWS_RANGE_KEY: str = f"{WINDOWS_KEY}_range"
 
-# Metrics whose None means an empty sample rather than an inapplicable arm.
-# mover_restricted_accuracy scores only the cells that changed, so a horizon
-# whose windows hold no changed cell returns None from sampling.
-# agent_position_accuracy is not a member: its None comes from the top-down
-# guard, and a some-None on it still refuses the series.
-SAMPLING_NULLABLE_METRICS: tuple[str, ...] = (MOVER_ACCURACY_KEY,)
+# Metrics whose None on some seeds gives a thin cell rather than refusing the
+# series: the mover-restricted ones, None where no scored window changed. A
+# seed whose artefact predates one of these also reads None, and is treated
+# as an empty sample in the same way.
+SAMPLING_NULLABLE_METRICS: tuple[str, ...] = (
+    MOVER_ACCURACY_KEY,
+    MOVER_MSE_KEY,
+    COPY_MOVER_MSE_KEY,
+    MOVER_MSE_SKILL_KEY,
+)
 
-# Why a cell was built from fewer than every seed. A closed set; nothing else
-# may be written into a cell's reason field.
+# Why a cell was built from fewer than every seed. Nothing else may be written
+# into a cell's reason field.
 SAMPLING_NULL_ON_SOME_SEEDS: str = "sampling_null_on_some_seeds"
 BELOW_SEED_FLOOR: str = "below_seed_floor"
 
@@ -109,8 +108,8 @@ BELOW_SEED_FLOOR: str = "below_seed_floor"
 # itself unavailable rather than aggregating.
 MIN_SEEDS_FOR_CELL: int = 3
 
-# The statistics an unavailable cell carries as null. aggregate_scalar's fields
-# less values, which carries the seeds that did measure it.
+# The statistics an unavailable cell carries as null: every aggregate_scalar
+# field except `values`.
 UNAVAILABLE_STATISTICS: tuple[str, ...] = (
     "mean",
     "std",
@@ -153,9 +152,8 @@ TRAINING_LOSS_SERIES: tuple[str, ...] = (
     "rep_ent",
 )
 
-# Fields recorded on the aggregate but never averaged: the comparator is a
-# constant, identical on every seed, so a mean of it is meaningless, but an
-# artefact omitting the comparator its numbers are read against is unreadable.
+# Policy fields copied onto the aggregate unaveraged. Inert, like the rest of
+# the policy side.
 POLICY_PROVENANCE_FIELDS: tuple[str, ...] = (
     "headline_action_rule",
     "random_policy_success_rate",
@@ -163,35 +161,32 @@ POLICY_PROVENANCE_FIELDS: tuple[str, ...] = (
 )
 
 class UnusableSeedError(ValueError):
-    """Raised when a seed is present but must not enter a reporting aggregate.
+    """Raised when a present seed must not enter a reporting aggregate.
 
-    Covers a truncated seed, a seed whose config snapshot disagrees with its
-    siblings, and curves sampled at steps that do not line up across seeds.
-
-    Not raised for a merely missing seed, which is the normal state mid-series
-    and belongs to ``series_is_complete``. This seed exists and is unusable.
+    A missing seed is SeriesIncompleteError's case.
     """
 
 
 class SeriesIncompleteError(ValueError):
-    """Raised on the CLI path when seeds are missing and --allow-partial is not set.
+    """Raised when the seeds do not form one comparable series.
 
-    A missing seed means run it. An unusable seed means do not report it.
-    Contrast UnusableSeedError.
+    Covers missing seeds without --allow-partial, nothing to aggregate,
+    disagreeing horizon grids or error metrics, a missing required key, and a
+    metric or parameter-tree block present on some seeds only.
     """
 
 
 def infer_run_name(series_dir: Path) -> str:
-    """Infer the run name from an explicit series directory.
+    """Return a series directory's own name as the run name.
 
-    The series directory is the run. Its children are `seed<n>` and its own
-    name is the run name, so there is nothing to parse.
+    Under the current layout a series directory is `<run>/<env>`, so this
+    returns the environment name.
 
     Args:
-        series_dir: A run directory whose children are `seed<n>` directories.
+        series_dir: A directory whose children are `seed<n>` directories.
 
     Returns:
-        The run name, which is the directory's own name.
+        The directory's own name.
 
     Raises:
         SeriesIncompleteError: If no `seed<n>` child directory is present, which
@@ -214,12 +209,9 @@ def infer_run_name(series_dir: Path) -> str:
 class CrossSeedAggregator:
     """Combine one run's per-seed artefacts into a reportable aggregate.
 
-    Reads, never writes, the per-seed artefacts. Runs once per run name and
-    arm, after every seed has completed.
-
-    Refuses to aggregate a truncated seed. A run killed mid-training leaves a
-    complete-looking artefact set behind, so ``completed_steps`` and
-    ``stopped_early`` are checked, not presence alone.
+    Reads, never writes, the per-seed artefacts, one run and arm at a time.
+    Refuses a truncated seed: `completed_steps` below the recorded budget, or
+    `stopped_early`, which the evaluate stage always writes as False.
     """
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -235,29 +227,19 @@ class CrossSeedAggregator:
     ) -> None:
         """Store what the aggregation reads and how it resamples.
 
-        The None defaults resolve from the module-level constants in the body,
-        not the signature, which would freeze them at import time.
-
         Args:
             run_name: The series-level run name, without any seed suffix.
             series_dir: Directory holding this series' per-seed directories.
-                Defaults to `outputs/<run_name>/<env>/`, which is where
-                `config.run_root` puts them. The override exists so a series
-                sitting outside the repository can be aggregated without being
-                moved first.
+                Defaults to the parent of `config.run_root`'s seed directory.
             seeds: The reporting seeds this series must carry.
-            reps: Bootstrap resamples for the confidence interval. The
-                load-bearing parameter. See aggregate_stats.BOOTSTRAP_REPS.
+            reps: Bootstrap resamples for the confidence interval.
             statistic_seed: Seed for the bootstrap's random state.
-            arm: Which arm's series to aggregate, one of config.ARMS. An
-                aggregate spans the seeds of one arm. The arms are separate
-                series, compared in the report and never averaged together.
+            arm: Which arm's series to aggregate, one of config.ARMS. Arms are
+                never averaged together.
             env: Registered environment name, defaulting to DEFAULT_ENV_NAME.
-                A directory level under the run name, so a series from a
-                non-default environment needs it or resolves to a path that
-                does not exist. Ignored when series_dir is given.
-            fast: Whether the series was produced by a fast run, which is
-                another directory level. Ignored when series_dir is given.
+                Ignored when series_dir is given.
+            fast: Whether the series was produced by a fast run. Ignored when
+                series_dir is given.
 
         Raises:
             ValueError: If the arm is not one of config.ARMS.
@@ -267,11 +249,8 @@ class CrossSeedAggregator:
         self.arm = arm
         self.run_name = run_name
         self.env = env or DEFAULT_ENV_NAME
-        # Derived from `run_root` rather than rebuilt. The seed directories are
-        # its children, so its parent is the series. Spelling the path out
-        # instead drops the environment and the fast level, and a default
-        # resolving to a directory no run writes reads as an empty series
-        # rather than a missing one.
+        # From `run_root`, so the environment and fast levels match where the
+        # seeds were written.
         self.series_dir = (
             series_dir
             if series_dir is not None
@@ -286,16 +265,9 @@ class CrossSeedAggregator:
     # -- paths ---------------------------------------------------------------
 
     def seed_dir(self, seed: int) -> Path:
-        """Return the artefact directory for one seed of this series.
+        """Return one seed's evaluation directory for this arm.
 
-        The one place seed directories are discovered, so a layout
-        change costs a single edit here:
-
-            <series>/seed<n>/arm<n>/eval/metrics_<mode>.json
-
-        The arm level must match `config.eval_dir`. Without it the aggregator
-        looks under `<series>/seed42/eval` while the metrics sit in
-        `<series>/seed42/arm1/eval`, and reports the series missing.
+        Mirrors `config.eval_dir`: `<series>/seed<n>/arm<n>/eval`.
 
         Args:
             seed: The reporting seed.
@@ -311,28 +283,16 @@ class CrossSeedAggregator:
         )
 
     def aggregate_path(self) -> Path:
-        """Return where this series' aggregate artefact is written.
-
-        The aggregate travels with the artefacts it describes. A canonical
-        location would overwrite a different run of the same name.
-
-        Returns:
-            Path to this arm's aggregate artefact.
-        """
+        """Return this arm's aggregate artefact path, beside its seed directories."""
         return self.series_dir / AGGREGATE_TEMPLATE.format(arm=self.arm)
 
     # -- completeness --------------------------------------------------------
 
     def discovered_modes(self) -> tuple[str, ...]:
-        """Return the observation modes this series has artefacts for.
-
-        Discovery, not instruction. The aggregate branch returns before the
-        config is built, so nothing on this path can tell it which mode to
-        read.
+        """Return the observation modes this series has metrics files for.
 
         Returns:
-            The modes found, sorted, so the aggregate's key order does not
-            depend on filesystem enumeration order.
+            The modes found, sorted.
         """
         prefix, suffix = METRICS_TEMPLATE.split("{mode}")
         found = {
@@ -343,15 +303,7 @@ class CrossSeedAggregator:
         return tuple(sorted(found))
 
     def present_seeds(self, mode: str) -> tuple[int, ...]:
-        """Return the seeds whose world-model artefact is on disk for one mode.
-
-        Presence is judged on the metrics file alone. The policy artefact is
-        legitimately absent, and requiring it would report a valid series as
-        incomplete forever.
-
-        Takes the mode, never assuming one. A run writes a mode-suffixed
-        metrics file and never a bare one, so presence is only answerable about
-        a specific mode.
+        """Return the seeds whose metrics file for one mode is on disk.
 
         Args:
             mode: The observation mode to look for.
@@ -368,19 +320,12 @@ class CrossSeedAggregator:
     def series_is_complete(self) -> bool:
         """Return whether every discovered mode carries every configured seed.
 
-        Separate from the loading path. The two entry points differ on what a
-        missing seed means.
-
-        Counted over (mode, seed) pairs, not over seeds. A bare glob would
-        average one mode's four seeds and report five, and degrading gracefully
-        here writes a wrong interval into the report.
-
-        Says nothing about whether the seeds are usable. A truncated seed is
-        present, so this returns True and _load_seed_artefacts raises later.
+        Counted per mode. A truncated seed counts as present here and is
+        refused when loaded.
 
         Returns:
             True when at least one mode was found and every mode found has
-            every configured seed. False on an empty series.
+            every configured seed.
         """
         modes = self.discovered_modes()
         return bool(modes) and all(
@@ -392,10 +337,7 @@ class CrossSeedAggregator:
     def _declared_error_metric(self, records: Sequence[dict]) -> str:
         """Return the error metric this mode's seeds were scored under.
 
-        Read from the artefacts rather than from a config, because it is the
-        scoring run that declares it. An artefact written before the field
-        existed carries cross-entropy by construction: it is the only metric
-        this codebase scored then.
+        An artefact without the field is read as cross-entropy.
 
         Args:
             records: The loaded per-seed records for one mode.
@@ -461,10 +403,6 @@ class CrossSeedAggregator:
     def _load_one_seed(self, seed: int, mode: str) -> dict:
         """Load one seed's artefacts and apply the truncation guard.
 
-        The guard covers the policy side too, so it reads the world-model
-        metrics file. The policy artefact carries no completed_steps and no
-        stopped_early of its own.
-
         Args:
             seed: The reporting seed to load.
             mode: The observation mode whose metrics file to read.
@@ -482,10 +420,8 @@ class CrossSeedAggregator:
                 encoding="utf-8"
             )
         )
-        # The filename is checked against the content. Discovery reads the
-        # mode off the name, and the name is the one part a human can change.
-        # A mismatch would file a series under the wrong mode with every shape
-        # agreeing and nothing raising.
+        # Checked against the content, since discovery reads the mode off the
+        # filename.
         recorded = metrics.get("observation_mode")
         if recorded is not None and recorded != mode:
             raise UnusableSeedError(
@@ -517,11 +453,11 @@ class CrossSeedAggregator:
         return {"seed": seed, "metrics": metrics, "policy": policy}
 
     def _assert_configs_agree(self, records: Sequence[dict]) -> None:
-        """Refuse a series whose seeds ran under different configurations.
+        """Refuse a series whose seeds' config snapshots differ.
 
-        Identical provenance across every seed is what makes a series
-        single-variable. Averaging one that varies in anything else produces a
-        number that means nothing while looking like one that does.
+        Only the fields `config_snapshot` records are compared, so seeds
+        differing in anything outside it, such as representation or collection
+        policy, pass as one series.
 
         Args:
             records: The loaded per-seed records.
@@ -550,18 +486,15 @@ class CrossSeedAggregator:
     def _aggregate_named_scalars(
         self, named_values: dict[str, list[float | None]]
     ) -> tuple[dict, dict]:
-        """Aggregate a group of metrics, omitting any with a missing value.
+        """Aggregate a group of policy metrics, omitting any with a missing value.
 
-        A metric is omitted, never imputed, when any seed's value is None. A
-        substituted zero would turn "undefined" into "measured as none".
+        A metric None on any seed is omitted, never imputed.
 
         Args:
             named_values: Metric name to its value on each seed, in seed order.
 
         Returns:
             The aggregated blocks, and a mapping of omitted metric to reason.
-            The second is written into the artefact so a reader sees the cause
-            of a gap, not only the gap.
         """
         aggregated: dict[str, dict] = {}
         omitted: dict[str, str] = {}
@@ -578,8 +511,6 @@ class CrossSeedAggregator:
                     self.run_name,
                 )
                 continue
-            # Passed explicitly, so the artefact records this aggregator's
-            # values.
             aggregated[name] = aggregate_scalar(
                 [value for value in values if value is not None],
                 reps=self.reps,
@@ -637,23 +568,15 @@ class CrossSeedAggregator:
     ) -> dict:
         """Aggregate every per-horizon metric across seeds, horizon by horizon.
 
-        Across seeds at a fixed horizon, never across horizons. The bootstrap
-        resamples seeds, which are the independent replications. Horizons are a
-        design axis, read at chosen values or fitted over the grid.
-
-        The metric names are discovered from the artefact and the required ones
-        are asserted, so a metric added to the writer is aggregated without an
-        edit here and a metric removed from it fails rather than vanishing.
+        Across seeds at a fixed horizon, never across horizons. Metric names
+        come from the first seed's block and the required keys are asserted, so
+        a metric the first seed lacks is dropped without raising.
 
         Args:
             records: The loaded per-seed records.
-            block_key: Which per-horizon block to aggregate. The secondary
-                parameter tree and the gap go through this same machinery, so
-                the gap carries intervals over seeds rather than being a
-                per-seed curiosity.
-            counts_windows: Whether the block carries a window count. The gap
-                does not: both trees are scored on one batch, so their window
-                counts are equal and their difference says nothing.
+            block_key: Which per-horizon block to aggregate.
+            counts_windows: Whether the block carries a window count. False for
+                the gap block.
 
         Returns:
             {horizon: {metric: aggregate block}}, plus a per-horizon window
@@ -722,8 +645,7 @@ class CrossSeedAggregator:
                 metric, horizon, values
             )
         if counts_windows:
-            # A range, not a mean. The window count varies by seed and by
-            # horizon and sets the sampling error on every accuracy above.
+            # A range across seeds, not a mean.
             counts = [block[WINDOWS_KEY] for block in blocks.values()]
             aggregated[WINDOWS_RANGE_KEY] = {
                 "min": min(counts),
@@ -736,12 +658,9 @@ class CrossSeedAggregator:
     ) -> dict | None:
         """Aggregate one metric at one horizon, or record it as inapplicable.
 
-        Undefined on every seed is a property of the run rather than of the
-        seeds: agent-position accuracy has no meaning in egocentric mode, and
-        the skill score is undefined where the copy baseline's cross-entropy is
-        zero. Undefined on some seeds means the runs are not comparable, unless
-        the metric is in SAMPLING_NULLABLE_METRICS, where it means an empty
-        sample instead.
+        None on every seed returns None. None on some seeds raises, except for
+        SAMPLING_NULLABLE_METRICS, which give a thin cell. A non-numeric value,
+        such as the smoothing report, returns None.
 
         Args:
             metric: The metric name.
@@ -749,10 +668,7 @@ class CrossSeedAggregator:
             values: Each seed's value for this metric.
 
         Returns:
-            The aggregate block, None where the metric is undefined on every
-            seed, or None where the value is not numeric. A sampling-nullable
-            metric undefined on some seeds returns a thin block carrying the
-            seeds that measured it.
+            The aggregate block, a thin block, or None.
 
         Raises:
             SeriesIncompleteError: If a metric outside SAMPLING_NULLABLE_METRICS
@@ -839,13 +755,9 @@ class CrossSeedAggregator:
     # -- policy --------------------------------------------------------------
 
     def _aggregate_policy(self, records: Sequence[dict]) -> dict | None:
-        """Aggregate task-success metrics for both action rules.
+        """Aggregate task-success metrics for each action rule.
 
-        Both action rules, aggregated separately. The headline is read from
-        the artefact's own field, never hardcoded.
-
-        Stale: nothing writes a policy artefact, so this returns None on every
-        current run. Removing it is a separate cleanup.
+        Returns None on every current run: nothing writes a policy artefact.
 
         Args:
             records: The loaded per-seed records.
@@ -910,10 +822,7 @@ class CrossSeedAggregator:
     def _aggregate_curves(self, records: Sequence[dict]) -> dict:
         """Aggregate the held-out fidelity curve and the loss series.
 
-        Gives a band, not one line per seed, so a dip on one seed is readable
-        against the others at the same step.
-
-        Stale: nothing writes either curve, so this returns empty lists.
+        Returns empty curves on every current run: nothing writes either.
 
         Args:
             records: The loaded per-seed records.
@@ -923,8 +832,7 @@ class CrossSeedAggregator:
 
         Raises:
             UnusableSeedError: If the curves are sampled at different steps
-                across seeds. Averaging misaligned curves produces a
-                meaningless line that would reach a figure unnoticed.
+                across seeds.
         """
         held_out = [record["metrics"].get("held_out_curve") or [] for record in records]
         loss = [
@@ -1034,9 +942,6 @@ class CrossSeedAggregator:
     def aggregate(self, allow_partial: bool = False) -> dict:
         """Build the aggregate payload, one series per discovered mode.
 
-        The comparison is between modes, so every mode belongs in one file
-        under one config digest.
-
         Args:
             allow_partial: Waive the all-seeds-present requirement. CLI only.
 
@@ -1095,16 +1000,13 @@ class CrossSeedAggregator:
             "run_name": self.run_name,
             "observation_mode": mode,
             "seeds": seeds,
-            # The real count, always. Under --allow-partial this is what
-            # stops a short series being read as the full protocol.
+            # The real seed count, below the protocol under --allow-partial.
             "n_seeds": len(seeds),
             "per_seed_completed_steps": {
                 str(record["seed"]): record["metrics"].get("completed_steps")
                 for record in records
             },
             "config": records[0]["metrics"].get("config"),
-            # Carried, not recomputed. The evaluate stage declares it and every
-            # reader downstream resolves its keys from this one value.
             ERROR_METRIC_KEY: self._declared_error_metric(records),
             "statistic": {
                 "iqm_reps": self.reps,
@@ -1113,9 +1015,6 @@ class CrossSeedAggregator:
                 "std_ddof": STD_DDOF,
             },
             PER_HORIZON_KEY: per_horizon,
-            # Always empty: an undefined metric either raises or is recorded as
-            # None against its own name. Kept visible so a reader can see the
-            # check ran rather than only its absence.
             OMITTED_METRICS_KEY: {},
             THIN_CELLS_KEY: self._thin_cells(mode, per_horizon),
             "policy": self._aggregate_policy(records),
@@ -1126,10 +1025,8 @@ class CrossSeedAggregator:
     def _aggregate_parameter_trees(self, records: Sequence[dict]) -> dict:
         """Aggregate the secondary parameter tree and the gap, when present.
 
-        Only the test pass writes them, so absence is the ordinary case and not
-        a fault. Required of every seed or of none: a series carrying the gap
-        on some seeds is not a series, and aggregating what is there would
-        report an interval over a subset under the full protocol's name.
+        Only the test pass writes them. A block present on some seeds and not
+        others raises.
 
         Args:
             records: The loaded per-seed records.
@@ -1173,9 +1070,6 @@ class CrossSeedAggregator:
     @staticmethod
     def _thin_cells(mode: str, per_horizon: dict) -> list[dict]:
         """List every cell built from fewer than every seed.
-
-        Each record identifies its cell without the surrounding context, so the
-        list reads on its own.
 
         Args:
             mode: The observation mode these cells belong to.
@@ -1256,26 +1150,18 @@ def aggregate_if_series_complete(
 ) -> Path | None:
     """Aggregate this run's seeds if every one of them has finished.
 
-    Called by `runner.run_pipeline` once its stages have run. An incomplete
-    set returns None, so a partial run leaves no artefact. There is no
-    allow_partial argument, so one seed cannot write a one-seed artefact
-    labelled as the series.
-
-    Failures are logged and swallowed. Re-run loudly with `--aggregate`. The
-    write is deterministic and idempotent, so a race only changes the log.
+    Called by the runner after its stages. An incomplete series returns None
+    and leaves any existing aggregate as it was. Failures are logged and
+    swallowed, so re-run with `--aggregate` to see them raised.
 
     Args:
         config: The run's experiment configuration.
-        arm: Which arm was trained and evaluated, one of config.ARMS. An
-            aggregate spans one arm, so the auto-trigger must aggregate the
-            arm that just ran rather than the default.
+        arm: Which arm was trained and evaluated, one of config.ARMS.
 
     Returns:
         The path written, or None when the series is incomplete or the
         aggregation failed.
     """
-    # config.run_name is the series name. The environment and the seed are
-    # directory levels below it, so nothing has to be stripped off.
     aggregator = CrossSeedAggregator(
         config.run_name, arm=arm, env=config.env.name, fast=config.fast
     )
@@ -1319,12 +1205,11 @@ def run_aggregation_cli(  # pylint: disable=too-many-arguments,too-many-position
 ) -> Path:
     """Aggregate a series from the command line and return the artefact path.
 
-    The CLI raises where the auto-trigger skips. An aggregate was asked for
-    explicitly, so an incomplete series is an error here and normal there.
+    Raises on an incomplete series, where the auto-trigger skips.
 
     Args:
-        run_name: The series-level run name. Required unless series_dir is
-            given, in which case it is inferred from the seed directories.
+        run_name: The series-level run name. When None, it is taken from
+            series_dir's own name.
         series_dir: Directory holding the seed-scoped run directories.
         allow_partial: Aggregate a below-protocol series.
         arm: Which arm's series to aggregate, one of config.ARMS.
