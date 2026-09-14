@@ -1,15 +1,8 @@
 """Cross-arm error against horizon, read from the per-arm aggregates.
 
-Puts every arm on one horizon axis so error against horizon can be compared
-across them. Aggregation is per arm and writes one file each; this reads those
-files and writes one artefact carrying all of them.
-
-Reads, never writes, the per-arm aggregates. Fits nothing: the power-law fit
-and the usable-horizon diagnostic read this artefact rather than living here.
-
-Arms may come from different runs. Arm 1's checkpoints are reused across
-experiments and the checkpoint directory follows the run name, so the arms of
-one comparison need not share a directory.
+Puts every arm's per-horizon error on one axis, with the endpoint error ratio
+and the compounding error per arm, in one artefact the fit reads. Arms may be
+read from different runs. Fits nothing and writes no aggregate.
 """
 
 from __future__ import annotations
@@ -21,6 +14,7 @@ from typing import Any, Sequence
 
 from config import (
     ARMS,
+    COMPOUNDING_DISCOUNT,
     DEFAULT_ENV_NAME,
     EXTRAPOLATION_HORIZONS,
     PROBABILITY_LOG_GLOB,
@@ -40,9 +34,17 @@ from src.pipeline.aggregate_stats import (
     aggregate_scalar,
 )
 from src.pipeline.metrics_schema import (
+    COPY_SIGMA_DISCOUNTED_INTEGRAL_KEY,
+    COPY_SIGMA_INTEGRAL_KEY,
+    COPY_SIGMA_SUM_KEY,
     ERROR_METRIC_CROSS_ENTROPY,
     ERROR_METRIC_KEY,
     PER_HORIZON_KEY,
+    SIGMA_DISCOUNTED_INTEGRAL_KEY,
+    SIGMA_INTEGRAL_KEY,
+    SIGMA_KEY,
+    SIGMA_SKILL_KEY,
+    SIGMA_SUM_KEY,
     SKILL_SCORE_KEY,
     copy_error_key,
     model_error_key,
@@ -55,47 +57,53 @@ logger = get_logger(__name__)
 def sweep_metrics(error_metric: str) -> tuple[str, ...]:
     """Return the per-horizon metrics the sweep carries for one error metric.
 
-    The error the ratio and the horizon axis are read on, resolved from the
-    metric the aggregates declare. The fit reads the model series under
-    whichever key that metric writes to, so naming one here would carry
-    cross-entropy onto a run that never scored it.
-
     Args:
         error_metric: The value the aggregates declare under ERROR_METRIC_KEY.
 
     Returns:
-        The model error key and the skill score that normalises it.
+        The model error key and the skill score.
     """
     return (model_error_key(error_metric), SKILL_SCORE_KEY)
 
 
 RATIO_KEY: str = "endpoint_error_ratio"
 
-# The same ratio read across the extrapolation horizons, under its own name.
-# A separate result, never folded into RATIO_KEY: horizons past the trained
-# ceiling test extrapolation of the jump function, which is a different question
-# from horizon robustness inside the trained range, and one number cannot answer
-# both.
+# The same ratio read out to the widest extrapolation horizon, kept apart from
+# RATIO_KEY.
 EXTRAPOLATION_RATIO_KEY: str = "extrapolation_error_ratio"
 
-# Where the horizons past the reporting grid are carried. The fit reads
-# "horizons" and nothing else, so keeping these apart is what stops the reported
-# exponent being fitted over out-of-distribution points.
+# Where the EXTRAPOLATION_HORIZONS members are carried. The fit and the
+# compounding error read only "horizons", so a member is never fitted.
+# Membership decides, not the trained range: on the long-horizon environment
+# these horizons lie inside it.
 EXTRAPOLATION_HORIZONS_KEY: str = "extrapolation_horizons"
 
-# Recorded where an arm's aggregate predates the field. Never raised: an arm
-# evaluated before the selection existed is a fact about the artefact, and
-# refusing here would make the whole sweep unreadable for one absent string.
+# Recorded where an arm's aggregate carries no params_selection.
 UNKNOWN_PARAMS_SELECTION: str = "unknown"
 
 PARAMS_SELECTION_KEY: str = "params_selection"
+
+# Fewest horizons the compounding error is read over.
+MIN_SIGMA_HORIZONS: int = 2
+
+# The compounding error's readings, in the order compounding_readings returns
+# them, for the model and for the copy baseline.
+SIGMA_READING_KEYS: tuple[str, str, str] = (
+    SIGMA_SUM_KEY,
+    SIGMA_INTEGRAL_KEY,
+    SIGMA_DISCOUNTED_INTEGRAL_KEY,
+)
+COPY_SIGMA_READING_KEYS: tuple[str, str, str] = (
+    COPY_SIGMA_SUM_KEY,
+    COPY_SIGMA_INTEGRAL_KEY,
+    COPY_SIGMA_DISCOUNTED_INTEGRAL_KEY,
+)
 
 
 class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     """Combine per-arm aggregates into one cross-arm horizon artefact.
 
-    An absent arm is skipped and named rather than raised, so the sweep is
-    readable while the remaining arms are still training.
+    An arm without an aggregate is skipped and recorded in the flags.
     """
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -115,8 +123,7 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             arm_runs: Per-arm run name overrides, keyed by arm. An arm absent
                 from this mapping falls back to run_name.
             series_dir: Directory holding run_name's per-seed directories.
-                Overrides the derived location for the fallback run only;
-                overridden arms always resolve through their own run name.
+                Used only for arms not named in arm_runs.
             env: Registered environment name, a directory level under the run.
             fast: Whether the series sits under the fast tree.
             reps: Bootstrap resamples for the ratio's interval. See
@@ -155,9 +162,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     def series_dir(self, arm: int) -> Path:
         """Return the directory holding one arm's per-seed directories.
 
-        Derived the same way CrossSeedAggregator derives it, so an arm read
-        from another run resolves through that run's own name rather than
-        through this one's directory.
+        An arm named in arm_runs resolves through its own run name. Any other
+        arm uses series_dir when one was given.
 
         Args:
             arm: The arm to locate.
@@ -178,8 +184,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     def sweep_path(self) -> Path:
         """Return where the cross-arm artefact is written.
 
-        Beside the aggregates of the run that was asked for, which is the run
-        the comparison belongs to even when one arm was read from elsewhere.
+        Beside the requested run's aggregates, even when an arm is read from
+        another run.
         """
         base = self._series_dir
         if base is None:
@@ -193,8 +199,7 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     ) -> list[str]:
         """Return the per-seed probability-log paths for one arm and mode.
 
-        Referenced rather than copied. Discovered by glob, so the filename
-        template is not restated here.
+        Found by glob and filtered on the mode suffix.
 
         Args:
             arm: The arm whose logs are wanted.
@@ -246,8 +251,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     def _declared_error_metric(self, loaded: dict[int, dict]) -> str:
         """Return the error metric the loaded aggregates declare.
 
-        An aggregate written before the field existed carries cross-entropy by
-        construction: it is the only metric this codebase scored then.
+        Read from the per-mode blocks under `by_mode`, falling back to an
+        aggregate's top level where none of its modes declares one.
 
         Args:
             loaded: {arm: aggregate payload} for the arms present.
@@ -256,16 +261,26 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             The declared metric.
 
         Raises:
-            ValueError: If the arms disagree. Arms scored under different
-                metrics cannot share a horizon axis or a ratio.
+            ValueError: If the arms or modes disagree, or if no aggregate
+                declares one.
         """
-        declared = {
-            payload.get(ERROR_METRIC_KEY, ERROR_METRIC_CROSS_ENTROPY)
-            for payload in loaded.values()
-        }
+        declared: set[str] = set()
+        for payload in loaded.values():
+            per_mode = {
+                block.get(ERROR_METRIC_KEY)
+                for block in (payload.get("by_mode") or {}).values()
+            } - {None}
+            declared |= per_mode or {payload.get(ERROR_METRIC_KEY)} - {None}
+        if not declared:
+            raise ValueError(
+                f"no aggregate of run '{self.run_name}' declares "
+                f"{ERROR_METRIC_KEY}, under 'by_mode' or at the top level. "
+                f"Re-run the aggregate before the sweep, since every key the "
+                f"sweep selects is resolved from that one value."
+            )
         if len(declared) > 1:
             raise ValueError(
-                f"arms of run '{self.run_name}' disagree about "
+                f"arms or modes of run '{self.run_name}' disagree about "
                 f"{ERROR_METRIC_KEY}: {sorted(declared)}. They were scored "
                 f"under different error metrics, so no cross-arm curve or "
                 f"ratio over them is readable."
@@ -277,9 +292,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     def _provenance(self, arm: int, mode_block: dict) -> dict:
         """Return one arm's provenance for one mode.
 
-        The parameter selection is read per mode, not per arm: an arm's modes
-        can be scored under different selections when only one of them has
-        been re-scored.
+        The parameter selection is read per mode, since an arm's modes can be
+        scored under different selections.
 
         Args:
             arm: The arm being described.
@@ -309,12 +323,10 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         }
 
     def _ratio(self, mode_block: dict) -> dict | None:
-        """Return the pre-registered endpoint error ratio for one arm and mode.
+        """Return the endpoint error ratio for one arm and mode.
 
-        Anchored at REPORTED_RATIO_HORIZONS, never at the widest horizons the
-        block carries. Reading `horizons[0], horizons[-1]` instead would
-        silently redefine the ratio under this same key whenever a horizon past
-        the reporting grid is added.
+        Anchored at REPORTED_RATIO_HORIZONS, never at the block's first and
+        last horizons.
 
         Args:
             mode_block: One arm's block for one observation mode.
@@ -326,11 +338,10 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         return self._ratio_between(mode_block, str(low), str(high))
 
     def _extrapolation_ratio(self, mode_block: dict) -> dict | None:
-        """Return the error ratio across the extrapolation horizons.
+        """Return the error ratio out to the widest extrapolation horizon.
 
-        Read from the pre-registered denominator, REPORTED_RATIO_HORIZONS[0],
-        to the widest extrapolation horizon present, so it answers how far the
-        curve moves outside the trained range.
+        From REPORTED_RATIO_HORIZONS[0] to the widest EXTRAPOLATION_HORIZONS
+        member present.
 
         Args:
             mode_block: One arm's block for one observation mode.
@@ -354,9 +365,9 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     ) -> dict | None:
         """Return the error ratio between two named horizons.
 
-        Computed per seed and then aggregated, so the interval is over seeds
-        rather than over a ratio of two aggregates. Both endpoints are named in
-        the result, so a reader need not trust the key.
+        Computed per seed, pairing the two horizons' values by position, then
+        aggregated over seeds. Both endpoints are named in the result. A zero
+        denominator on any seed returns None without a flag.
 
         Args:
             mode_block: One arm's block for one observation mode.
@@ -399,12 +410,116 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         block["metric"] = model_error_key(self.error_metric)
         return block
 
+    def _sigma(self, mode_block: dict) -> dict | None:
+        """Return the compounding error for one arm and mode.
+
+        Over every horizon outside EXTRAPOLATION_HORIZONS. Per seed, for the
+        model and the copy baseline: the plain sum, the trapezoidal integral
+        over h, and the integral weighted by COMPOUNDING_DISCOUNT ** h, each
+        aggregated across seeds. The skill score is 1 - model integral / copy
+        integral, per seed.
+
+        Args:
+            mode_block: One arm's block for one observation mode.
+
+        Returns:
+            The compounding-error block, or None when the curves cannot be
+            read.
+        """
+        per_horizon = mode_block.get(PER_HORIZON_KEY, {})
+        horizons = [
+            horizon
+            for horizon in sorted_horizons(per_horizon)
+            if int(horizon) not in EXTRAPOLATION_HORIZONS
+        ]
+        if len(horizons) < MIN_SIGMA_HORIZONS:
+            return None
+        model_curves = self._seed_curves(
+            mode_block, horizons, model_error_key(self.error_metric)
+        )
+        copy_curves = self._seed_curves(
+            mode_block, horizons, copy_error_key(self.error_metric)
+        )
+        if model_curves is None or copy_curves is None:
+            return None
+        if len(model_curves) != len(copy_curves):
+            message = (
+                f"{mode_block.get('observation_mode')} carries "
+                f"{len(model_curves)} model seeds and {len(copy_curves)} copy "
+                f"seeds, so no per-seed compounding error can be formed"
+            )
+            logger.warning("%s", message)
+            self.flags.append(message)
+            return None
+        axis = [int(horizon) for horizon in horizons]
+        per_seed = {
+            **dict(zip(SIGMA_READING_KEYS, compounding_readings(axis, model_curves))),
+            **dict(
+                zip(COPY_SIGMA_READING_KEYS, compounding_readings(axis, copy_curves))
+            ),
+        }
+        block: dict[str, Any] = {
+            key: aggregate_scalar(
+                values, reps=self.reps, statistic_seed=self.statistic_seed
+            )
+            for key, values in per_seed.items()
+        }
+        model_integral = per_seed[SIGMA_INTEGRAL_KEY]
+        copy_integral = per_seed[COPY_SIGMA_INTEGRAL_KEY]
+        block[SIGMA_SKILL_KEY] = (
+            aggregate_scalar(
+                [
+                    1.0 - model / copy
+                    for model, copy in zip(model_integral, copy_integral)
+                ],
+                reps=self.reps,
+                statistic_seed=self.statistic_seed,
+            )
+            if all(copy_integral)
+            else None
+        )
+        block["horizons"] = horizons
+        block["discount"] = COMPOUNDING_DISCOUNT
+        block["metric"] = model_error_key(self.error_metric)
+        return block
+
+    def _seed_curves(
+        self, mode_block: dict, horizons: list[str], key: str
+    ) -> list[list[float]] | None:
+        """Return one error curve per seed over the named horizons.
+
+        Args:
+            mode_block: One arm's block for one observation mode.
+            horizons: The horizon keys to read, in order.
+            key: The per-horizon metric to read.
+
+        Returns:
+            One list per seed, one value per horizon, or None when a horizon
+            lacks the metric or the seed counts disagree.
+        """
+        per_horizon = mode_block.get(PER_HORIZON_KEY, {})
+        columns = [
+            (per_horizon[horizon].get(key) or {}).get("values")
+            for horizon in horizons
+        ]
+        if not all(columns):
+            return None
+        if len({len(column) for column in columns}) > 1:
+            message = (
+                f"{mode_block.get('observation_mode')} carries different seed "
+                f"counts for {key} across horizons {horizons}, so no per-seed "
+                f"compounding error can be formed"
+            )
+            logger.warning("%s", message)
+            self.flags.append(message)
+            return None
+        return [list(curve) for curve in zip(*columns)]
+
     def _horizon_entry(self, mode: str, horizon: str, arms: dict[int, dict]) -> dict:
         """Build one horizon's entry for one observation mode.
 
-        The copy baseline and the window count are properties of the data
-        rather than of an arm, so they are carried once and the arm they were
-        read from is named.
+        The copy error and window range are read from the first arm present,
+        which is named, and every other arm is checked against them.
 
         Args:
             mode: The observation mode.
@@ -443,11 +558,9 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         block: dict,
         entry: dict,
     ) -> None:
-        """Flag an arm whose baseline or window count differs from the source.
+        """Flag an arm whose copy error or window range differs from the source arm's.
 
-        Both are properties of the evaluation data. Arms disagreeing about
-        them were not evaluated on the same windows, which makes the horizon
-        curve a comparison of two things at once.
+        The difference is flagged and the sweep still completes.
 
         Args:
             mode: The observation mode, for the message.
@@ -470,10 +583,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
     def _mode_entry(self, mode: str, arms: dict[int, dict]) -> dict:
         """Build one observation mode's cross-arm block.
 
-        The two horizon blocks are separate. `horizons` carries the reporting
-        grid and is what the fit reads, so the reported exponent is fitted
-        inside the trained range whatever else was scored.
-        `extrapolation_horizons` carries the rest under its own name.
+        `horizons` holds every horizon outside EXTRAPOLATION_HORIZONS and is
+        what the fit reads. `extrapolation_horizons` holds the members.
 
         Args:
             mode: The observation mode.
@@ -504,6 +615,7 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
                     EXTRAPOLATION_RATIO_KEY: self._extrapolation_ratio(
                         mode_block
                     ),
+                    SIGMA_KEY: self._sigma(mode_block),
                     "probability_logs": self.probability_log_paths(
                         arm, mode, mode_block.get("seeds") or []
                     ),
@@ -528,6 +640,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
 
         Raises:
             FileNotFoundError: If no arm has an aggregate at all.
+            ValueError: If the aggregates declare no error metric, or disagree
+                about it.
         """
         self.flags = []
         loaded = self.load_arms()
@@ -544,17 +658,13 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
         modes = sorted({mode for blocks in by_arm_mode.values() for mode in blocks})
         return {
             "run_name": self.run_name,
-            # Carried from the aggregates so the fit resolves its own key from
-            # one declaration rather than inferring the metric from which keys
-            # the artefact happens to hold.
             ERROR_METRIC_KEY: self.error_metric,
             "arm_runs": {str(arm): self.arm_run(arm) for arm in sorted(loaded)},
             "arms_present": [str(arm) for arm in sorted(loaded)],
             "arms_absent": [str(arm) for arm in ARMS if arm not in loaded],
             "observation_modes": modes,
-            # The endpoint ratio is the only quantity resampled here. Every
-            # per-horizon block was resampled by the aggregator and each
-            # aggregate records the settings that produced it.
+            # Settings for the ratios and the compounding error, the only
+            # quantities resampled here.
             "ratio_statistic": {
                 "reps": self.reps,
                 "seed": self.statistic_seed,
@@ -618,6 +728,47 @@ def sorted_horizons(per_horizon: dict) -> list[str]:
     return sorted(per_horizon, key=int)
 
 
+def trapezoid(axis: Sequence[float], values: Sequence[float]) -> float:
+    """Return the trapezoidal integral of values over an unevenly spaced axis.
+
+    Args:
+        axis: The sample points, ascending.
+        values: One value per sample point.
+
+    Returns:
+        The integral from the first sample point to the last.
+    """
+    return sum(
+        (right_x - left_x) * (left_y + right_y) / 2.0
+        for left_x, right_x, left_y, right_y in zip(
+            axis, axis[1:], values, values[1:]
+        )
+    )
+
+
+def compounding_readings(
+    axis: Sequence[int], curves: Sequence[Sequence[float]]
+) -> tuple[list[float], list[float], list[float]]:
+    """Return each curve's plain sum, integral and discounted integral over h.
+
+    Args:
+        axis: The horizons, ascending.
+        curves: One error curve per seed, one value per horizon.
+
+    Returns:
+        Three lists with one value per curve, in SIGMA_READING_KEYS order.
+    """
+    weights = [COMPOUNDING_DISCOUNT**horizon for horizon in axis]
+    return (
+        [sum(curve) for curve in curves],
+        [trapezoid(axis, curve) for curve in curves],
+        [
+            trapezoid(axis, [weight * error for weight, error in zip(weights, curve)])
+            for curve in curves
+        ],
+    )
+
+
 def parse_arm_runs(pairs: Sequence[str] | None) -> dict[int, str]:
     """Parse repeated `N=RUN_NAME` arguments into a per-arm run mapping.
 
@@ -651,9 +802,9 @@ def run_sweep_cli(  # pylint: disable=too-many-arguments,too-many-positional-arg
     """Sweep a run's arms from the command line and return the artefact path.
 
     Args:
-        run_name: The run every arm is read from unless overridden. Required
-            unless series_dir is given, which infers it.
-        series_dir: Directory holding the seed run directories.
+        run_name: The run every arm is read from unless overridden. When None,
+            it is taken from series_dir's own name.
+        series_dir: Directory holding the fallback run's seed directories.
         arm_runs: Repeated `N=RUN_NAME` per-arm overrides.
         env: Registered environment name.
         fast: Whether the series sits under the fast tree.

@@ -1,13 +1,9 @@
 """Power-law fits and the usable-horizon diagnostic, read from the sweep.
 
-The headline metric is the exponent c in error(h) = a + b*h^c. That estimator
-is not always identified, so every estimator is computed on every run and the
-order in which they are reported is fixed here rather than chosen after the
-numbers are seen. The endpoint ratio is carried through from the sweep as the
-readout that depends on no fit at all.
-
-Reads the cross-arm sweep artefact and writes one file beside it. Fits nothing
-that the sweep already measured and recomputes none of its aggregates.
+Every estimator of the exponent in error(h) = a + b*h^c is computed on every
+run, and which one is reported follows a fixed order. The endpoint ratio and
+the compounding error are carried from the sweep unchanged. Writes one file
+beside the sweep.
 """
 
 from __future__ import annotations
@@ -46,6 +42,7 @@ from src.pipeline.aggregate_stats import (
 from src.pipeline.metrics_schema import (
     ERROR_METRIC_CROSS_ENTROPY,
     ERROR_METRIC_KEY,
+    SIGMA_KEY,
     SKILL_SCORE_KEY,
     model_error_key,
 )
@@ -61,8 +58,7 @@ THREE_PARAMETER: str = "three_parameter"
 TWO_PARAMETER: str = "two_parameter"
 LOG_LOG: str = "log_log"
 
-# Why an exponent was not identified. A closed vocabulary; a free-text reason
-# cannot be compared across runs.
+# Why an exponent was not identified, from a closed vocabulary.
 REASON_RELATIVE_ERROR: str = "relative_standard_error_above_ceiling"
 REASON_COVARIANCE: str = "covariance_not_finite"
 REASON_STARTS_DISAGREE: str = "start_points_disagree"
@@ -81,8 +77,7 @@ MIN_POINTS_TWO: int = 3
 class FitResult:  # pylint: disable=too-many-instance-attributes
     """One estimator's answer on one seed's curve.
 
-    identified is the field callers act on. An exponent read without it is a
-    number the data does not support.
+    `exponent` is set even when `identified` is False.
     """
 
     estimator: str
@@ -117,8 +112,8 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
 class UsableHorizon:
     """Where one arm beats the stationary-copy baseline.
 
-    The set and the range are both carried because the winning horizons are not
-    always a prefix of the axis.
+    The winning set and its range are both carried, since the winners need not
+    be a prefix of the axis.
     """
 
     horizons: tuple[int, ...] = ()
@@ -234,8 +229,7 @@ def _residuals(
 def _start_point(start: Sequence[float | None], errors: np.ndarray) -> list[float]:
     """Resolve a configured start point against one seed's curve.
 
-    None in the leading slot means that seed's error at the shortest horizon,
-    so one start is derived from the data and the others are fixed.
+    A None takes that seed's error at the shortest horizon.
     """
     return [float(errors[0]) if value is None else float(value) for value in start]
 
@@ -244,14 +238,11 @@ def fit_three_parameter(
     horizons: np.ndarray,
     errors: np.ndarray,
 ) -> FitResult:
-    """Fit error(h) = a + b*h^c, the pre-registered form.
+    """Fit error(h) = a + b*h^c.
 
-    This is the primary estimator. It is frequently unidentified on flat
-    curves: as c approaches zero, h^c approaches one at every horizon and the
-    model collapses to the constant a + b, which infinitely many (a, b) pairs
-    reproduce. The standard error is one piece of evidence for that and the
-    spread across start points is the other, so callers must consult
-    FitResult.identified rather than reading the exponent alone.
+    Identified only when the first start's relative standard error meets
+    FIT_IDENTIFIED_MAX_RSE and every start converges with exponents within
+    FIT_START_AGREE_TOL of each other. The exponent is returned either way.
 
     Args:
         horizons: The evaluation horizons, ascending.
@@ -335,13 +326,10 @@ def fit_two_parameter(
     horizons: np.ndarray,
     errors: np.ndarray,
 ) -> FitResult:
-    """Fit error(h) = b*h^c, the offset-free form.
+    """Fit error(h) = b*h^c.
 
-    Reported when the three-parameter fit is unidentified. Removing a removes
-    the cancellation that makes c unidentifiable, at the cost of asserting
-    there is no irreducible error floor, which is false. The exponent is
-    therefore not the same quantity as the pre-registered c and is named
-    separately in the artefact so the two cannot be confused.
+    Its exponent is not the three-parameter c and is named separately in the
+    artefact.
 
     Args:
         horizons: The evaluation horizons, ascending.
@@ -382,15 +370,9 @@ def log_log_slope(
 ) -> FitResult:
     """Fit the slope of log(error) against log(h) by ordinary least squares.
 
-    A robustness check on fit_two_parameter rather than a third opinion. The
-    two differ only in weighting: this minimises relative error, so every
-    horizon counts equally, while fit_two_parameter minimises absolute error
-    and is dominated by the largest values. Agreement between them is evidence
-    that the exponent does not depend on that choice.
-
-    Errors must be strictly positive; a non-positive value returns an
-    unidentified result rather than raising, because a zero error is a
-    legitimate artefact value and not a caller error.
+    The two-parameter exponent fitted in log space, where every horizon's
+    relative error weighs equally. Never reported. A non-positive error returns
+    an unidentified result.
 
     Args:
         horizons: The evaluation horizons, ascending.
@@ -433,18 +415,10 @@ def usable_horizons(
 ) -> UsableHorizon:
     """Return where the model beats the copy baseline, as a set and a range.
 
-    The usable horizon is the largest h at which the model still beats the
-    copy baseline, which assumes the model wins at short horizons and stops.
-    The measured shape is the reverse on egocentric observations, where the
-    model loses at h = 1 and wins at every longer horizon, because a copy is
-    nearly perfect when the view has barely changed. The full set is therefore
-    returned alongside the range, and a range whose lower bound exceeds the
-    shortest horizon is flagged so no reader takes the upper bound as a span
-    starting at one.
-
-    An empty set returns None with a reason rather than zero. Zero is a number
-    and would be averaged and plotted; the reason distinguishes losing at every
-    horizon from being inapplicable.
+    The range is the contiguous run of winners ending at the largest winning
+    horizon, which is the gate scalar. It can start above the shortest horizon,
+    which `starts_above_min` records. With no readable block or no winner, the
+    result carries a reason and no scalar.
 
     Args:
         horizons: The evaluation horizons, ascending.
@@ -495,6 +469,8 @@ def aggregate_exponents(
 ) -> dict | None:
     """Aggregate one estimator's per-seed exponents across seeds.
 
+    Every finite exponent enters, identified or not.
+
     Args:
         results: One estimator's result on each seed.
         reps: Bootstrap resamples.
@@ -527,12 +503,10 @@ class HorizonFit:
     ) -> None:
         """Store where the sweep is read from and where the fit is written.
 
-        The series directory is resolved once here; both artefacts sit in it.
-
         Args:
             run_name: The run whose sweep artefact is read.
-            series_dir: Directory holding the sweep artefact. Overrides the
-                derived location.
+            series_dir: Directory holding the sweep and fit artefacts. Overrides
+                the derived location.
             env: Registered environment name, a directory level under the run.
             fast: Whether the series sits under the fast tree.
             reps: Bootstrap resamples for the exponent's interval.
@@ -575,24 +549,22 @@ class HorizonFit:
     def _declared_error_metric(self, sweep: dict) -> str:
         """Return the error metric the sweep declares.
 
-        An artefact written before the field existed carries cross-entropy by
-        construction, because it is the only metric this codebase scored then.
-
         Args:
             sweep: The sweep artefact.
 
         Returns:
             The declared metric.
+
+        Raises:
+            ValueError: If the sweep declares none.
         """
         declared = sweep.get(ERROR_METRIC_KEY)
         if declared is None:
-            logger.info(
-                "%s declares no %s, reading it as %s",
-                safe_rel(self.source_path()),
-                ERROR_METRIC_KEY,
-                ERROR_METRIC_CROSS_ENTROPY,
+            raise ValueError(
+                f"{safe_rel(self.source_path())} declares no "
+                f"{ERROR_METRIC_KEY}. Re-run the sweep, which resolves it from "
+                f"the aggregates."
             )
-            return ERROR_METRIC_CROSS_ENTROPY
         return declared
 
     def _curves(self, mode_block: dict, arm: str) -> tuple[list[int], list[list[float]]]:
@@ -608,7 +580,7 @@ class HorizonFit:
 
         Raises:
             ValueError: If the declared error metric's key is absent at every
-                horizon, which is a selection fault rather than a partial run.
+                horizon.
         """
         key = model_error_key(self.error_metric)
         horizons = sorted_horizons(mode_block.get("horizons", {}))
@@ -619,15 +591,15 @@ class HorizonFit:
             .get(key)
             for horizon in horizons
         }
-        # Absent everywhere is the metric being read under the wrong name;
-        # absent at one horizon is a run that did not finish.
+        # Absent at every horizon raises. Absent at some is flagged below and
+        # returns no curves.
         if horizons and all(block is None for block in blocks.values()):
             raise ValueError(
                 f"{mode_block.get('observation_mode')} arm {arm} declares "
                 f"{ERROR_METRIC_KEY} {self.error_metric!r} but carries no "
-                f"{key} at any of its {len(horizons)} horizons. The artefact "
-                "was scored under a different metric, or the declaration is "
-                "wrong."
+                f"{key} at any of its {len(horizons)} horizons. The "
+                f"declaration comes from the sweep, so check that first: the "
+                f"series may be correct and the sweep reading it wrongly."
             )
         columns = []
         for horizon in horizons:
@@ -697,9 +669,9 @@ class HorizonFit:
             for name in (THREE_PARAMETER, TWO_PARAMETER, LOG_LOG)
         }
         block["reported_exponent"] = self._reported(block)
-        # Read through rather than recomputed. The ratio is the readout that
-        # depends on no fit, and it travels in this file.
+        # Carried from the sweep, not recomputed.
         block[RATIO_KEY] = arm_entry.get(RATIO_KEY)
+        block[SIGMA_KEY] = arm_entry.get(SIGMA_KEY)
         block["seeds"] = list(seeds)
         block["horizons"] = list(horizons)
         return block
@@ -734,12 +706,12 @@ class HorizonFit:
         }
 
     def _reported(self, block: dict) -> dict:
-        """Return which exponent is reported, following the fixed ladder.
+        """Return which exponent is reported, following the fixed order.
 
-        The order is fixed before the data is seen: the pre-registered
-        three-parameter exponent, and the offset-free exponent only when the
-        first is unidentified. The offset-free exponent is a different quantity
-        and is named as one.
+        The three-parameter exponent when it is identified on every seed,
+        otherwise the two-parameter exponent, named as a different quantity.
+        The fallback is reported whether or not it is itself identified, and
+        its value aggregates every finite per-seed exponent.
 
         Args:
             block: The arm's estimator blocks.
@@ -890,8 +862,8 @@ def run_fit_cli(
     """Fit a run's swept horizon curves and return the artefact path.
 
     Args:
-        run_name: The run whose sweep is read. Required unless series_dir is
-            given, which infers it.
+        run_name: The run whose sweep is read. When None, it is taken from
+            series_dir's own name.
         series_dir: Directory holding the sweep artefact.
         env: Registered environment name.
         fast: Whether the series sits under the fast tree.
