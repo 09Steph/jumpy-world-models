@@ -149,8 +149,8 @@ class CrossArmSweep:  # pylint: disable=too-many-instance-attributes
             BOOTSTRAP_SEED if statistic_seed is None else statistic_seed
         )
         self.flags: list[str] = []
-        # Overwritten in sweep() from what the aggregates declare. Defaulted so
-        # every key selection has a value before an aggregate is read.
+        # sweep() sets this from what the aggregates declare. An absent
+        # declaration raises there, so this value is never read.
         self.error_metric: str = ERROR_METRIC_CROSS_ENTROPY
 
     # -- paths ---------------------------------------------------------------

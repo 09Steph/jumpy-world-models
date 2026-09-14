@@ -519,6 +519,8 @@ class HorizonFit:
         self.reps = BOOTSTRAP_REPS if reps is None else reps
         self.statistic_seed = BOOTSTRAP_SEED if statistic_seed is None else statistic_seed
         self.flags: list[str] = []
+        # fit() sets this from what the sweep declares. An absent declaration
+        # raises there, so this value is never read.
         self.error_metric: str = ERROR_METRIC_CROSS_ENTROPY
 
     def source_path(self) -> Path:
