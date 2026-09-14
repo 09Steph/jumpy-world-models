@@ -1,9 +1,7 @@
 """Write a dataset from a recorded corpus rather than from a live rollout.
 
-Takes any `TrajectorySource` and streams its episodes into shards the rest of
-the pipeline reads. The live path cuts episodes at a termination flag; a
-recorded corpus supplies them already finished, so the two construct an episode
-by different rules and are separate stages.
+The stage resolves its corpus from the environment and streams the source's
+episodes into the shards the rest of the pipeline reads.
 """
 
 from __future__ import annotations
@@ -15,10 +13,10 @@ from typing import Iterable, Iterator
 import jax
 
 from config import (
-    OFFLINE_SOURCE,
     TRAJECTORY_SHARD_GLOB,
     TRAJECTORY_SHARD_TEMPLATE,
     ExperimentConfig,
+    offline_source_for_env,
 )
 from src.data.trajectory import Trajectory
 from src.data.offline_sources import build_offline_source
@@ -39,45 +37,54 @@ SOURCE_PROVENANCE_KEY: str = "offline_source"
 class OfflineGenerateStage(Stage):
     """Convert a recorded corpus into trajectory shards.
 
-    Streams shard by shard, so the corpus is never held in memory at once.
+    Holds one shard's episodes in memory at a time.
 
     Attributes:
         store: The shard writer.
-        source_name: Which corpus this stage converts.
+        source_name: The registry name of the corpus, resolved from the
+            environment.
     """
 
     name: str = "offline_generate"
     dataset_derived: bool = True
 
-    def __init__(
-        self, config: ExperimentConfig, source_name: str = OFFLINE_SOURCE
-    ) -> None:
-        """Build the stage over one declared corpus.
+    def __init__(self, config: ExperimentConfig) -> None:
+        """Build the stage over the corpus its environment declares.
 
         Args:
             config: The composed experiment configuration.
-            source_name: One of OFFLINE_SOURCES.
+
+        Raises:
+            ValueError: If the environment's family registers no corpus.
         """
         super().__init__(config)
         self.store = TrajectoryStore()
-        self.source_name = source_name
+        self.source_name = offline_source_for_env(config.env.name)
         self._settings: dict | None = None
 
     @property
     def settings(self) -> dict:
-        """Return the source settings this dataset is keyed on.
+        """Return the source settings this dataset is keyed on, cached.
 
-        Resolved once and cached; building a source opens the corpus.
-
-        Returns:
-            The settings the factory reports for this source.
+        Building an Atari source raises when a shard is absent from disk, so
+        the skip check and the manifest both need the archive present.
         """
         if self._settings is None:
             _, self._settings = build_offline_source(self.source_name)
         return self._settings
 
     def run(self) -> None:
-        """Stream the corpus into shards under the dataset directory."""
+        """Stream the corpus into shards under the dataset directory.
+
+        Existing shards are overwritten by index but never removed, so a rerun
+        that writes fewer shards than the last leaves the old higher-index
+        shards in place, and every reader globs them.
+
+        Raises:
+            ValueError: If the directory holds another corpus's shards, the
+                source yields nothing, or it yields fewer episodes than the
+                settings declare.
+        """
         source, settings = build_offline_source(self.source_name)
         self._settings = settings
         target = self.dataset_dir
@@ -107,6 +114,15 @@ class OfflineGenerateStage(Stage):
                 "silently yields nothing would leave a sentinel over an empty "
                 "directory"
             )
+        expected = settings["num_episodes"]
+        if written < expected:
+            raise ValueError(
+                f"the '{self.source_name}' source yielded {written} episodes "
+                f"against the {expected} this dataset is keyed on, so "
+                f"{safe_rel(target)} holds a short dataset. The per-cell counts "
+                "are in the log lines above. Left to complete, a shortfall "
+                "lands a sentinel and trains as though the corpus were whole"
+            )
         logger.info(
             "offline generation complete: %d episodes, %d shards -> %s",
             written,
@@ -115,17 +131,10 @@ class OfflineGenerateStage(Stage):
         )
 
     def _stamped(self, episode: Trajectory) -> Trajectory:
-        """Return the episode with the source that produced it recorded.
+        """Return a copy of the episode with SOURCE_PROVENANCE_KEY set.
 
-        The source name is the stage's, not the source's: a source does not
-        know the registry name it was resolved under, and that name is what
-        the collision guard compares.
-
-        Args:
-            episode: The episode about to be written.
-
-        Returns:
-            A copy carrying SOURCE_PROVENANCE_KEY in its provenance.
+        The value is the registry name the stage resolved, which
+        `_reject_a_foreign_dataset` compares. A source does not know it.
         """
         return replace(
             episode,
@@ -138,9 +147,10 @@ class OfflineGenerateStage(Stage):
     def _reject_a_foreign_dataset(self, target: Path) -> None:
         """Raise rather than overwrite shards a different corpus wrote.
 
-        `dataset_dir` is keyed on the run name, seed, fast flag and
-        environment name, so two corpora declared under one environment name
-        land in one directory and the second silently overwrites the first.
+        `dataset_dir` does not include the corpus, so a corpus routed to an
+        environment whose directory already holds another's shards would
+        overwrite them. It reads only the first shard's first episode and
+        compares the source name, not the settings.
 
         Args:
             target: The dataset directory about to be written.
@@ -178,11 +188,10 @@ class OfflineGenerateStage(Stage):
     def sentinel_identity(self) -> dict:
         """Return the identity and integrity fields guarding this dataset.
 
-        The source name, episode count, window settings and shard size all
-        change what the shards contain, so each has to be here. Left out, a
-        rerun at a different setting matches this sentinel and trains on the
-        previous dataset. HORIZON_MAX is one such setting and is absent; see
-        `offline_sources`.
+        Carries the source name, every setting the factory reports, and the
+        count and byte size of the shard files present. A setting the factory
+        leaves out lets a rerun at a different value match this sentinel and
+        train on the previous dataset.
 
         Returns:
             JSON-serialisable identity and integrity fields.
@@ -229,8 +238,7 @@ def _chunked(
         One list per shard, the last possibly shorter.
 
     Raises:
-        ValueError: If the size is not positive, which would accumulate the
-            whole corpus into one shard.
+        ValueError: If the size is less than 1.
     """
     if size < 1:
         raise ValueError(f"shard size must be at least 1, got {size}")
