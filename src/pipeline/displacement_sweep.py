@@ -1,29 +1,18 @@
 """Displacement across every registered NAVIX environment, under both policies.
 
-Displacement is the fraction of grid cells differing between the frame at t and
-the frame at t + h. It is the stationary-copy baseline's error exactly: that
-baseline predicts s_{t+h} = s_t, so the cells that differ are its mistakes. A
-dataset whose displacement is near zero leaves a learned model almost nothing to
-add, whatever the model is.
+Displacement is the percentage of grid cells that differ in any channel between
+the frames at t and t + h. It equals the per-cell error of copying s_t forward
+unchanged, which is not the calibrated copy baseline the evaluation reports.
 
-Both arms roll through one jitted scan on the same environment with the same
-episode handling, so a difference between them is the collection policy and
-nothing else.
+Both arms roll from the same key, so they start from the same resets. A pair is
+kept only when the step index advances by exactly h, which excludes pairs that
+span an episode reset.
 
-Pairs spanning a reset are excluded by requiring the step index to advance by
-exactly h, which only holds inside one episode. A pair crossing a reset would
-compare two unrelated episodes and read as enormous displacement.
+Every view is rendered from the same states inside the scan, and the states are
+not kept. Records are appended as JSON lines after each environment and seed.
 
-Frames are rendered inside the scan and states discarded. A stacked NAVIX state
-repeats the sprite atlas on every transition, where a frame rendered from it
-does not.
-
-Records are appended one JSON object per line as each environment and seed
-completes, so an interrupted sweep resumes from what it already wrote and a torn
-final line is discarded on read rather than corrupting the file.
-
-Reached only from --displacement-sweep, never from run_pipeline. The stage
-writes no dataset, trains no world model and touches no arm.
+Called from --displacement-sweep only. It trains a PPO policy per environment
+and seed, but writes no dataset and trains no world model.
 """
 
 from __future__ import annotations
@@ -42,7 +31,10 @@ from config import (
     DISPLACEMENT_SWEEP_HORIZONS,
     DISPLACEMENT_SWEEP_RECORDS_FILENAME,
     DISPLACEMENT_SWEEP_ROLLOUT_STEPS,
+    OBS_FN_EGOCENTRIC_NAVIX,
     OBS_FN_TOP_DOWN_NAVIX,
+    OBS_MODE_EGOCENTRIC,
+    OBS_MODE_TOP_DOWN,
     SEEDS,
     EnvConfig,
     displacement_sweep_dir,
@@ -54,9 +46,8 @@ from src.utils.paths import ensure_dir, safe_rel
 
 logger = get_logger(__name__)
 
-# Parallel environments and the episode cap come from the generator's own
-# defaults, so a swept figure and a generated dataset are measured on the same
-# episode shape.
+# Parallel environments and the episode cap are EnvConfig's defaults. --fast
+# does not change them, and early termination stays on.
 _ENV_DEFAULTS = EnvConfig()
 SWEEP_NUM_ENVS: int = _ENV_DEFAULTS.num_envs
 SWEEP_MAX_EPISODE_STEPS: int = _ENV_DEFAULTS.max_episode_steps
@@ -64,13 +55,19 @@ SWEEP_MAX_EPISODE_STEPS: int = _ENV_DEFAULTS.max_episode_steps
 UNIFORM_ARM: str = "uniform"
 PPO_ARM: str = "ppo"
 
-# One row per environment, seed, arm and horizon. The per-channel columns stay
-# in the records file, where a channel count that varies by environment costs
-# nothing.
+# Views rendered from every state, as (mode, NAVIX observation function name).
+SWEEP_VIEWS: tuple[tuple[str, str], ...] = (
+    (OBS_MODE_TOP_DOWN, OBS_FN_TOP_DOWN_NAVIX),
+    (OBS_MODE_EGOCENTRIC, OBS_FN_EGOCENTRIC_NAVIX),
+)
+
+# One row per environment, seed, arm, view and horizon. Per-channel values are
+# in the records file only.
 CSV_COLUMNS: tuple[str, ...] = (
     "environment",
     "seed",
     "arm",
+    "mode",
     "horizon",
     "displacement_pct",
     "num_pairs",
@@ -79,27 +76,33 @@ CSV_COLUMNS: tuple[str, ...] = (
 
 def roll(
     env: Any, key: jax.Array, action_fn: Callable
-) -> tuple[jax.Array, jax.Array]:
-    """Roll every parallel environment forward, rendering frames in the scan.
+) -> tuple[dict[str, jax.Array], jax.Array]:
+    """Roll every parallel environment forward, rendering each view in the scan.
+
+    Both views are rendered from the same state at every step, so they describe
+    the same trajectories and share one step index.
 
     Args:
         env: The navix environment.
-        key: PRNG key seeding the reset and every action draw.
+        key: PRNG key for the initial reset and every action draw.
         action_fn: Takes (timestep, key) and returns one action per environment.
 
     Returns:
-        Stacked frames and step indices, both leading with time.
+        Stacked frames per mode, each leading with time, and the step indices.
     """
-    # Top-down, because the stored saturation verdicts a swept figure is
-    # checked against are read on that mode.
-    observation_fn = getattr(navix.observations, OBS_FN_TOP_DOWN_NAVIX)
+    observation_fns = {
+        mode: getattr(navix.observations, fn_name) for mode, fn_name in SWEEP_VIEWS
+    }
     timestep = jax.vmap(env.reset)(jax.random.split(key, SWEEP_NUM_ENVS))
 
     def step(carry, _):
         current, rng = carry
         rng, action_key = jax.random.split(rng)
         nxt = jax.vmap(env.step)(current, action_fn(current, action_key))
-        frames = jax.vmap(observation_fn)(current.state)
+        frames = {
+            mode: jax.vmap(observation_fn)(current.state)
+            for mode, observation_fn in observation_fns.items()
+        }
         return (nxt, rng), (frames, current.t)
 
     _, out = jax.lax.scan(
@@ -140,9 +143,8 @@ def displacement_at(
 ) -> tuple[float, int]:
     """Mean percentage of cells differing between t and t + horizon.
 
-    A percentage, not the fraction hamming_displacement returns. The stored
-    saturation verdicts are on this scale, so a figure compared against one
-    must be too.
+    A percentage, the scale of the saturation threshold, not the fraction
+    hamming_displacement returns.
 
     Args:
         frames: Stacked frames, leading axis time.
@@ -150,8 +152,8 @@ def displacement_at(
         horizon: The gap to measure across.
 
     Returns:
-        The percentage and the number of admissible pairs. A zero count is not
-        a failure: no episode survived the horizon, which is itself the finding.
+        The percentage and the number of admissible pairs. NaN and a zero count
+        when no pair survives the horizon.
     """
     columns, pairs = displacement_columns(frames, times, horizon)
     if columns is None:
@@ -159,15 +161,24 @@ def displacement_at(
     return 100.0 * float(columns[-1]), pairs
 
 
-def _records_for_arm(
-    env_name: str, seed: int, arm: str, frames: np.ndarray, times: np.ndarray
+def _records_for_arm(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    env_name: str,
+    seed: int,
+    arm: str,
+    mode: str,
+    frames: np.ndarray,
+    times: np.ndarray,
 ) -> list[dict]:
-    """Measure one arm across the horizon grid.
+    """Measure one arm in one view across the horizon grid.
+
+    Percentages are not comparable across views: the egocentric crop turns
+    with the agent.
 
     Args:
         env_name: Registered environment identifier.
         seed: The seed this rollout was drawn under.
         arm: Collection policy name.
+        mode: Observation mode the frames were rendered in.
         frames: Stacked frames, leading axis time.
         times: Step indices, shape (time, envs).
 
@@ -182,6 +193,7 @@ def _records_for_arm(
             "environment": env_name,
             "seed": seed,
             "arm": arm,
+            "mode": mode,
             "horizon": horizon,
             "displacement_pct": (
                 None if columns is None else 100.0 * float(columns[-1])
@@ -197,14 +209,16 @@ def _records_for_arm(
 
 
 def measure_environment(env_name: str, seed: int) -> list[dict]:
-    """Measure both arms on one environment at one seed.
+    """Measure both arms in both views on one environment at one seed.
+
+    PPO is trained once and serves both views.
 
     Args:
         env_name: Registered environment identifier.
         seed: The seed for training, the reset and every action draw.
 
     Returns:
-        The records for both arms across the horizon grid.
+        The records for both arms in both views across the horizon grid.
     """
     env = navix.make(env_name, max_steps=SWEEP_MAX_EPISODE_STEPS)
     num_actions = int(env.action_space.maximum) + 1
@@ -223,19 +237,18 @@ def measure_environment(env_name: str, seed: int) -> list[dict]:
         (PPO_ARM, trained_actions),
     ):
         frames, times = roll(env, jax.random.PRNGKey(seed + 1), action_fn)
-        records.extend(
-            _records_for_arm(
-                env_name, seed, arm, np.asarray(frames), np.asarray(times)
+        times = np.asarray(times)
+        for mode, _ in SWEEP_VIEWS:
+            records.extend(
+                _records_for_arm(
+                    env_name, seed, arm, mode, np.asarray(frames[mode]), times
+                )
             )
-        )
     return records
 
 
 def read_records(path: Path) -> list[dict]:
-    """Return every parsable record in a JSON-lines file.
-
-    A line that does not parse is discarded. An interrupted append leaves one,
-    and it names work that did not finish.
+    """Return every parsable record in a JSON-lines file, discarding the rest.
 
     Args:
         path: The records file, which need not exist.
@@ -254,7 +267,10 @@ def read_records(path: Path) -> list[dict]:
 
 
 def completed_keys(path: Path) -> set[tuple[str, int]]:
-    """Return the (environment, seed) pairs the records file already holds.
+    """Return the (environment, seed) pairs holding at least one record.
+
+    A pair whose append was interrupted counts as done even if some of its
+    records are missing.
 
     Args:
         path: The records file, which need not exist.
@@ -265,24 +281,14 @@ def completed_keys(path: Path) -> set[tuple[str, int]]:
 
 
 def _append_records(path: Path, records: Sequence[dict]) -> None:
-    """Append records to the JSON-lines file, one object per line.
-
-    Args:
-        path: The records file.
-        records: The records to append.
-    """
+    """Append records to the JSON-lines file, one object per line."""
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record) + "\n")
 
 
 def _write_csv(path: Path, records: Iterable[dict]) -> None:
-    """Write the tabular view of the records.
-
-    Args:
-        path: The CSV to write.
-        records: Every record the sweep holds.
-    """
+    """Write the CSV view of the records."""
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -298,12 +304,9 @@ def run_displacement_sweep_cli(
 ) -> Path:
     """Sweep every registered environment under both policies and write both files.
 
-    Environments loop inside seeds, so the breadth claim across the registry is
-    complete after one seed and every later seed only narrows it. No environment
-    runs twice in succession, so there is no compiled agent to amortise.
-
-    An environment that will not build or train is logged and skipped rather
-    than ending the sweep.
+    Loops environments inside seeds. An environment whose measurement raises is
+    logged and skipped. Without skip_existing, records already in the file are
+    appended again.
 
     Args:
         run_name: Name this sweep's artefacts are filed under.
@@ -336,8 +339,6 @@ def run_displacement_sweep_cli(
             )
             try:
                 records = measure_environment(env_name, seed)
-            # Broad by intent: one environment that will not build or train
-            # must not take the rest of the registry with it.
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 logger.error(
                     "FAILED %s seed %d: %s: %s",
