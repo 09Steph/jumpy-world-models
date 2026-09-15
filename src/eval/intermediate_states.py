@@ -1,37 +1,21 @@
 """Decode the states an autoregressive arm produces between start and endpoint.
 
-Arm 2 reaches the endpoint through a latent rollout and reports an error close
-to arm 1's, while arm 3 shares its architecture and grows with the horizon. The
-states in between are where that difference either shows or does not, and
-nothing in the pipeline has ever written them out.
+The shipped scan emits no per-step output, so each rollout is rebuilt from the
+model's public methods through ``apply(method=...)``. A test checks the rebuilt
+endpoint against the shipped one.
 
-Each rollout is rebuilt outside the model from the model's own public methods,
-reached through ``apply(method=...)``. ``ar_baseline.py``'s scan body returns
-``None`` for the per-step output, and a model edited to emit one is not the
-model that produced the results, so the reconstruction is checked against the
-shipped endpoint rather than trusted.
+``rollout_tokens`` is the training path and keeps the state as a token.
+``rollout_observations`` is the discrete scoring path, re-encoding an argmax at
+every step, and is rebuilt for discrete representations only. Continuous arms
+are scored through ``rollout_values``, which is not rebuilt, so pixel
+intermediates come from the training path. A number read off one path does not
+reproduce on another.
 
-Both rollouts are covered and they are not interchangeable. ``rollout_tokens``
-is the training path: the state stays a token and the decoder runs once, at the
-endpoint. ``rollout_observations`` is the path both arms are scored through,
-decoding and re-encoding an argmax at every step. A number read off one and
-labelled with the other does not reproduce. The observations path is discrete
-only, because the method it mirrors argmaxes over a class axis.
+Each per-step record names its distance-from-truth unit: a differing-cell
+fraction on a discrete representation, a squared error on a continuous one.
 
-Both representations are decoded here, and which measures are defined follows
-from the representation rather than from the environment. Validity is class
-membership on one and bounds membership on the other; distance from truth is a
-differing-cell fraction on one and a squared error on the other, and the record
-names which.
-
-The quantities travelling with the images. A decoded grid is an argmax, so a
-latent that moves without crossing a class boundary and a latent that does not
-move at all draw the same picture, and those mean opposite things. The
-token-space distance separates them, and the decoded-space distance reports the
-same movement after the decoder.
-
-Reached only from --intermediate-states, never from run_pipeline. It reads
-checkpoints, trains nothing, and writes only under its own directory.
+Called from --intermediate-states only. It reads checkpoints and datasets,
+trains no model and writes only under its own directory.
 """
 
 # pylint: disable=too-many-lines
@@ -84,7 +68,8 @@ from config import (  # noqa: E402  pylint: disable=wrong-import-position,ungrou
 from src.data.trajectory import ObservationMode  # noqa: E402  pylint: disable=wrong-import-position
 from src.data.trajectory_store import TrajectoryStore  # noqa: E402  pylint: disable=wrong-import-position
 from src.eval.metrics import model_mse  # noqa: E402  pylint: disable=wrong-import-position
-from src.eval.plots import CHANNEL_LABELS, FIGURE_DPI  # noqa: E402  pylint: disable=wrong-import-position
+from src.eval.figure_style import FIGURE_DPI  # noqa: E402  pylint: disable=wrong-import-position
+from src.eval.plots import CHANNEL_LABELS  # noqa: E402  pylint: disable=wrong-import-position
 from src.pipeline.displacement import hamming_displacement  # noqa: E402  pylint: disable=wrong-import-position
 from src.pipeline.train import (  # noqa: E402  pylint: disable=wrong-import-position
     CHECKPOINT_BEST_PARAMS_KEY,
@@ -99,23 +84,19 @@ from src.utils.paths import ensure_dir, safe_rel  # noqa: E402  pylint: disable=
 
 logger = get_logger(__name__)
 
-# One decoded grid per column, one channel per row. Sized so a hundred-step
-# strip stays a strip rather than becoming a wall.
+# One decoded grid per column, one channel per row.
 STRIP_COLUMN_WIDTH: float = 0.35
 STRIP_ROW_HEIGHT: float = 0.42
 STRIP_LABEL_FONTSIZE: int = 4
 STRIP_ROW_LABEL_FONTSIZE: int = 6
 
-# Stripped so two invocations at one seed write byte-identical files. Left in,
-# it records the matplotlib version and a rebuilt environment changes the bytes.
+# Metadata cleared so reruns write byte-identical files.
 FIGURE_METADATA: dict[str, None] = {"Software": None}
 
-# The bounds a continuous decoder emits between. Its output passes through a
-# sigmoid, so this is value_range's normalised image rather than a second
-# declaration of it, and the check needs no scale to apply.
+# The bounds a continuous decoder's sigmoid output lies between.
 DECODED_VALUE_BOUNDS: tuple[float, float] = (0.0, 1.0)
 
-# Record fields, used by the writer and by the tests that read them back.
+# Record fields.
 RECORD_STEP_KEY: str = "step"
 RECORD_VALID_KEY: str = "grid_is_valid"
 RECORD_TRUTH_DISTANCE_KEY: str = "cells_differing_from_truth"
@@ -129,9 +110,8 @@ RECORD_TRUTH_DISTANCE_UNIT_KEY: str = "truth_distance_unit"
 TRUTH_DISTANCE_UNIT_CELLS: str = "fraction_of_cells_differing"
 TRUTH_DISTANCE_UNIT_MSE: str = "mean_squared_error"
 
-# The summary's own fields. The token-distance statistics run over steps 1 to
-# h: step 0 is a definitional zero rather than a measurement, since
-# token_distances opens with [0.0] and appends.
+# The summary's own fields. endpoint_cells_differing is a squared error on a
+# continuous domain, and a summary row does not name its unit.
 SUMMARY_DISTINCT_KEY: str = "distinct_cells_differing"
 SUMMARY_TOKEN_MEDIAN_KEY: str = "token_distance_median"
 SUMMARY_TOKEN_MEAN_KEY: str = "token_distance_mean"
@@ -149,13 +129,12 @@ SUMMARY_DRAW_SEED_KEY: str = "draw_seed"
 SUMMARY_ELIGIBLE_COUNT_KEY: str = "eligible_count"
 SUMMARY_VALID_ALL_KEY: str = "grid_is_valid_all"
 
-# What identifies one summary row. Stated here rather than taken from
-# cell_fields, which omits the arm: keyed off cell_fields alone, arms 2 and 3
-# merge into one row and the distinct-grid contrast is destroyed.
+# What identifies one summary row. cell_fields omits the arm, so it cannot key
+# the summary. Rollout path and truth source are not part of the key.
 SUMMARY_KEY_FIELDS: tuple[str, ...] = ("seed", "mode", "arm", "horizon")
 
-# What identifies one per-step record. A repeat means a cell was decoded twice
-# into a file opened for append.
+# What identifies one per-step record. Rollout path and truth source are not
+# part of the key.
 RECORD_KEY_FIELDS: tuple[str, ...] = (
     "seed",
     "mode",
@@ -329,7 +308,7 @@ def observation_rollout(  # pylint: disable=too-many-arguments,too-many-position
     return jnp.stack(grids), jnp.stack(carries), module.decoder(tokens)
 
 
-# The rollout each path name reconstructs. The two answer different questions.
+# The rollout each path name reconstructs.
 ROLLOUT_FUNCTIONS: dict[str, Callable] = {
     ROLLOUT_PATH_TOKENS: token_rollout,
     ROLLOUT_PATH_OBSERVATIONS: observation_rollout,
@@ -341,10 +320,13 @@ class RolloutTrace:
     """One arm's rollout, kept step by step.
 
     Attributes:
-        grids: Decoded class grids, (steps, batch, height, width, channels).
+        grids: Decoded states, (steps, batch, height, width, channels). Step 0
+            is the decoded start on the tokens path and the input observation
+            on the observations path.
         carries: Token carries before the decoder,
             (steps, batch, num_state_tokens, d_model).
-        endpoint: Endpoint logits, one array per channel.
+        endpoint: One logits array per channel, or one array of values on a
+            continuous domain.
     """
 
     grids: jax.Array
@@ -384,7 +366,12 @@ class DecodeRequest:
 
 
 def config_for(request: DecodeRequest, seed: int) -> ExperimentConfig:
-    """Compose the configuration one cell's checkpoint was trained under.
+    """Compose the configuration a cell's checkpoint restores against.
+
+    Only the environment, representation and fast mode come from the request.
+    Collection policy, slip and early termination stay at their defaults, so a
+    fresh-rollout truth series is drawn under default dynamics and a uniform
+    policy whatever the run used.
 
     Args:
         request: What is being decoded.
@@ -447,9 +434,6 @@ def load_arm(
 ):
     """Restore one arm's best-loss parameters.
 
-    Best-loss rather than final-step, which is the primary parameter tree for
-    every reported number.
-
     Args:
         request: What is being decoded.
         config: The configuration that cell was trained under.
@@ -460,9 +444,7 @@ def load_arm(
         The unbound model and its best-loss parameter tree.
 
     Raises:
-        FileNotFoundError: If the checkpoint directory is absent. Restoring
-            nothing would leave randomly initialised weights behind a name that
-            claims otherwise.
+        FileNotFoundError: If the checkpoint directory is absent.
     """
     directory = checkpoint_directory(request, config.seed, mode, arm)
     if not directory.is_dir():
@@ -544,11 +526,7 @@ def grid_is_valid(grid: jax.Array, cardinality: Sequence[int]) -> bool:
 def values_are_valid(values: jax.Array) -> bool:
     """Return whether every decoded value lies inside the decoder's bounds.
 
-    The continuous counterpart to `grid_is_valid`, and not the same kind of
-    measurement. `ConvPixelDecoder` ends in a sigmoid, so this cannot return
-    False for the shipped decoder, where `grid_is_valid` on a discrete field
-    can. Kept so both domains write the same field, not as evidence that the
-    continuous model is well behaved.
+    Always True for the shipped decoder, which ends in a sigmoid.
 
     Args:
         values: One decoded state, (..., height, width, channels).
@@ -578,9 +556,6 @@ def state_is_valid(state: jax.Array, domain: ObservationDomain) -> bool:
 
 def cells_differing(predicted: jax.Array, truth: jax.Array) -> float:
     """Return the fraction of cells differing in any channel.
-
-    The stationary-copy baseline's own error measure, so a decoded state is
-    scored the same way every reported prediction is.
 
     Args:
         predicted: One decoded grid, (height, width, channels).
@@ -652,15 +627,15 @@ def distance_from_truth(
 def token_distances(carries: jax.Array) -> list[float]:
     """Return the token-space distance from each step's carry to the previous.
 
-    Continuous, and taken before the decoder. A decoded grid is an argmax, so a
-    carry that moves without crossing a class boundary is indistinguishable
-    from one that does not move at all once it has been discretised.
+    Taken before the decoder, so it separates a latent that moves without
+    crossing a class boundary from one that does not move.
 
     Args:
         carries: Token carries, (steps, batch, num_state_tokens, d_model).
 
     Returns:
-        One distance per step, the first being zero by definition.
+        One Euclidean distance per step, the first being zero by definition.
+        Unnormalised, so it scales with the number of state tokens.
     """
     values = [0.0]
     for index in range(1, carries.shape[0]):
@@ -670,14 +645,10 @@ def token_distances(carries: jax.Array) -> list[float]:
 
 
 def decoded_distances(frames: jax.Array) -> list[float]:
-    """Return the change from each decoded state to the previous one.
+    """Return the mean squared change from each decoded state to the previous one.
 
-    The continuous counterpart to `token_distances`, taken after the decoder
-    because a pixel field has no argmax for movement to hide behind. Mean
-    rather than summed, so the value does not scale with grid size.
-
-    It applies no scale and is given none, so it cannot normalise values that a
-    decoder already emitted normalised.
+    Applied on every domain. On a discrete one it squares differences of class
+    codes, so its size depends on the class numbering.
 
     Args:
         frames: Decoded states, (steps, height, width, channels), as the
@@ -821,8 +792,7 @@ class TruthSource:
 def dataset_directory(request: DecodeRequest, seed: int) -> Path:
     """Locate one seed's dataset, honouring an off-repository root.
 
-    The same rearrangement `checkpoint_directory` applies to the checkpoints
-    path, applied to the dataset path. No second root flag.
+    Applies the same root rearrangement as `checkpoint_directory`.
 
     Args:
         request: What is being decoded.
@@ -839,10 +809,6 @@ def dataset_directory(request: DecodeRequest, seed: int) -> Path:
 
 def test_split_indices(directory: Path) -> list[int]:
     """Read the persisted held-out indices.
-
-    The split is not recomputed. `split_from_config` needs per-trajectory
-    lengths in store order, which would mean reading every shard first, and the
-    indices are already written by the preparation stage.
 
     Args:
         directory: The dataset directory.
@@ -884,11 +850,8 @@ def draw_test_episode(
 ) -> TruthSource:
     """Draw one held-out episode and take its truth series.
 
-    One draw per seed, shared by both observation modes and reused at every
-    horizon. The draw is from the set eligible at the longest evaluation
-    horizon, and eligibility is monotone, so the same episode serves the whole
-    grid. Two modes are two renderings of one episode, so a per-mode draw would
-    make a mode difference unattributable between mode and episode.
+    One draw per seed, from the set eligible at the longest evaluation horizon,
+    shared by both observation modes and every horizon.
 
     Args:
         request: What is being decoded.
@@ -902,9 +865,7 @@ def draw_test_episode(
     Raises:
         FileNotFoundError: If the dataset holds no shards or no split.
         RuntimeError: If no held-out episode covers the longest horizon.
-        ValueError: If the drawn episode is shorter than the horizon. Cannot
-            fire while the draw comes from the longest-horizon eligible set;
-            kept as a guard against a horizon grid that extends past it.
+        ValueError: If the drawn episode is shorter than the horizon.
     """
     directory = dataset_directory(request, config.data_seed)
     indices = test_split_indices(directory)
@@ -952,9 +913,8 @@ def truth_for_horizon(
 ) -> TruthSource:
     """Return one cell's truth series from the requested source.
 
-    Falls back to a fresh roll when the held-out path is asked for and the
-    shards are not present, recording which source was used rather than
-    claiming the one that was requested.
+    Falls back to a fresh roll when the held-out shards or split are absent,
+    and records the source used.
 
     Args:
         request: What is being decoded.
@@ -993,10 +953,8 @@ def summary_statistics(
     application and is an outlier the mean alone would bury. Median and mean
     are reported together for the same reason.
 
-    The distinct-state count is discrete only. It rests on exact equality,
-    which two decoder outputs differing in the last float place never satisfy,
-    so on a continuous domain it would report every step distinct and read as
-    the opposite of a collapse.
+    The distinct count is the number of distinct distance-from-truth values, a
+    lower bound on distinct states, and is None on a continuous domain.
 
     Args:
         records: One cell's records, in any order.
@@ -1035,10 +993,8 @@ def endpoint_per_cell_accuracy(
 ) -> float:
     """Score a decoded grid the way `per_cell_accuracy` scores logits.
 
-    Over cells and channels, which is the reduction the evaluation uses. The
-    cell measure beside it divides by cells alone and counts a cell wrong in
-    one channel of three as fully wrong, so the two are not comparable and a
-    delta between them would be non-zero from the definitions.
+    Over cells and channels, as `per_cell_accuracy` reduces, so it is not one
+    minus the any-channel differing fraction.
 
     Args:
         decoded: The decoded classes, (height, width, channels).
@@ -1063,6 +1019,9 @@ def reported_per_cell_accuracy(
     carries the extrapolation sweep's longer horizons, and pairing one of those
     with an episode drawn from the shorter eligible set compares two different
     things.
+
+    Read from the named run, which is the validation split unless the run name
+    carries the test suffix.
 
     Args:
         request: What is being decoded.
@@ -1126,10 +1085,6 @@ def _draw_pixel_row(
     axes, frames: np.ndarray, arm: int, *, label_columns: bool
 ) -> None:
     """Draw one arm's whole rollout as images, one column per step.
-
-    One image per step rather than one panel per channel: colour channels are
-    not categorical fields, and panelling them invites the misreading the
-    categorical panels exist to prevent.
 
     Args:
         axes: One axes per step, in order.
@@ -1341,7 +1296,7 @@ def _decoder_validation(  # pylint: disable=too-many-arguments,too-many-position
     A smoke test for gross disagreement, not an equality claim. One episode
     against a many-window aggregate is not an equality claim whatever number is
     attached, so no tolerance is stated: none has been measured. It
-    catches a decoder wired to the wrong parameter tree, horizon or split, and
+    catches a decoder wired to the wrong parameter tree or horizon, and
     does not catch small systematic error.
 
     Undefined on a continuous domain, where the evaluation reports no per-cell
@@ -1387,9 +1342,9 @@ def _record_key(record: dict, fields: Sequence[str]) -> tuple:
 def append_records(path: Path, records: Iterable[dict]) -> None:
     """Append records as JSON lines, refusing a repeated key.
 
-    The file is opened for append, so a cell decoded twice would double every
-    statistic taken over it and a summary reading those records would
-    faithfully reproduce the doubling.
+    The key omits the rollout path and truth source, so a second path or source
+    into the same file is refused too. A refusal ends the pass before the
+    summary is written.
 
     Args:
         path: The records file.
@@ -1425,9 +1380,8 @@ def append_records(path: Path, records: Iterable[dict]) -> None:
 def _write_summary(path: Path, summaries: Sequence[dict]) -> None:
     """Write the summary rows, replacing any row with the same key.
 
-    A separate artefact from the per-step records, and rewritten whole rather
-    than appended, so re-decoding a cell updates its row instead of adding a
-    second one.
+    Rewritten whole. A row with the same seed, mode, arm and horizon is
+    replaced, whatever its rollout path or truth source.
 
     Args:
         path: The summary file.
@@ -1453,8 +1407,8 @@ def run_intermediate_states_cli(
 ) -> Path:
     """Decode every requested cell and write the strips and the records.
 
-    A cell that cannot be loaded is logged and skipped rather than ending the
-    pass, so one absent checkpoint does not cost the rest of the grid.
+    Any failure inside a cell is logged and skipped, but a repeated record ends
+    the pass.
 
     Args:
         request: What is being decoded.
@@ -1489,8 +1443,6 @@ def run_intermediate_states_cli(
                     records, summaries = decode_cell(
                         request, seed, mode, horizon, target
                     )
-                # Broad by intent: one absent or unreadable checkpoint must not
-                # take the rest of the grid with it.
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.error(
                         "FAILED seed %d %s h=%d: %s: %s",
