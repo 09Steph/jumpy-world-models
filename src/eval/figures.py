@@ -26,7 +26,10 @@ from config import (
 )
 from src.eval import figure_panels as panels
 from src.eval.figure_style import SPLIT_DISPLAY, VECTOR_EXTENSION, FigureStyleError
-from src.eval.intermediate_figures import build_intermediate_compounding
+from src.eval.intermediate_figures import (
+    build_intermediate_compounding,
+    build_intermediate_compounding_decoded,
+)
 from src.eval.plots import draw_figure
 from src.utils.logging_setup import get_logger
 from src.utils.paths import ensure_dir, safe_rel
@@ -121,6 +124,9 @@ FIGURE_REGISTRY: tuple[FigureSpec, ...] = (
                "3", panels.build_checkpoint_ladder),
     FigureSpec("A1", "fig:skill_across_representations", "Skill score across representations",
                "A", panels.build_skill_across_representations),
+    FigureSpec("A3", "fig:intermediate_compounding_decoded",
+               "Intermediate-state divergence per step, decoded grid",
+               "A", build_intermediate_compounding_decoded),
 )
 
 
