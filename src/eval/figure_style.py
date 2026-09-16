@@ -54,7 +54,7 @@ BAR_GROUP_WIDTH: float = 0.8
 BAR_EDGE_WIDTH_PT: float = 0.3
 HATCH_PATTERN: str = "////"
 SERIES_MARKER: str = "o"
-ARM_MARKERS: dict[int, str] = {1: "o", 2: "s", 3: "^"}
+REPRESENTATION_MARKERS: dict[str, str] = {"symbolic": "o", "rgb": "s"}
 SECONDARY_MARKER: str = "D"
 COPY_MARKER: str = "|"
 COPY_MARKER_SCALE: float = 2.5
@@ -120,9 +120,9 @@ PDF_FONT_TYPE: int = 42
 HORIZON_AXIS_LABEL: str = "Prediction horizon h (steps)"
 HORIZON_SHORT_AXIS_LABEL: str = "Horizon h (steps)"
 ARM_DISPLAY: dict[int, str] = {
-    1: "Arm 1 -- Direct",
-    2: "Arm 2 -- Autoregressive to endpoint",
-    3: "Arm 3 -- Autoregressive one-step",
+    1: "Arm 1 -- Jumpy",
+    2: "Arm 2 -- AR-Endpoint",
+    3: "Arm 3 -- AR-Step",
 }
 ARM_SHORT_DISPLAY: dict[int, str] = {1: "Arm 1", 2: "Arm 2", 3: "Arm 3"}
 POLICY_DISPLAY: dict[str, str] = {"uniform": "Uniform collection", "PPO": "PPO collection"}
@@ -148,12 +148,12 @@ ESTIMATOR_DISPLAY: dict[str, str] = {
     "log_log": "Log-log slope",
 }
 ENV_DISPLAY: dict[str, str] = {
-    "Navix-FourRooms-v0": "NAVIX FourRooms",
-    "Navix-DoorKey-Random-5x5-v0": "NAVIX DoorKey",
-    "Navix-Dynamic-Obstacles-16x16-v0": "NAVIX Dynamic-Obstacles",
-    "Navix-Dynamic-Obstacles-8x8-v0": "NAVIX Dynamic-Obstacles 8x8",
-    "Navix-DoorKey-16x16-v0": "NAVIX DoorKey 16x16",
-    "Navix-KeyCorridorS6R3-v0": "NAVIX KeyCorridor",
+    "Navix-FourRooms-v0": "FourRooms",
+    "Navix-DoorKey-Random-5x5-v0": "DoorKey",
+    "Navix-Dynamic-Obstacles-16x16-v0": "Dynamic-Obstacles",
+    "Navix-Dynamic-Obstacles-8x8-v0": "Dynamic-Obstacles 8x8",
+    "Navix-DoorKey-16x16-v0": "DoorKey 16x16",
+    "Navix-KeyCorridorS6R3-v0": "KeyCorridor",
     "atari-dqn-replay": "Atari (DQN Replay)",
     "atari-dqn-replay-p24": "Atari (DQN Replay), position 24",
     "atari-dqn-replay-p49": "Atari (DQN Replay), position 49",
@@ -162,10 +162,10 @@ ENV_DISPLAY: dict[str, str] = {
 METRIC_DISPLAY: dict[str, str] = {
     "model_cross_entropy": "Cross-entropy (nats)",
     "model_mse": "Mean squared error",
-    "copy_normalised_skill_score": "Copy-normalised skill score",
+    "copy_normalised_skill_score": "Skill score",
     "mover_restricted_skill_score": "Mover-restricted skill score",
     "mover_restricted_accuracy": "Mover-restricted accuracy",
-    "mean_changed_cells": "Cells changed\nfrom the start",
+    "mean_changed_cells": "Cells changed from\nthe start (count)",
     "reported_exponent": "Fitted exponent",
     "endpoint_error_ratio": "Endpoint error ratio",
     "compounding_error_integral": "Compounding error\n(integral over horizons)",
@@ -174,17 +174,17 @@ METRIC_DISPLAY: dict[str, str] = {
     "residual": "Fit residual",
     "token_distance_mean": "Token distance\nbetween steps",
     "decoded_distance_mean": "Decoded-grid distance\nbetween steps",
-    "hamming_cell_fraction": "Cells differing (per cent)",
+    "hamming_cell_fraction": "Displacement (per cent)",
     "displacement_pct": "Displacement at h = 100 (per cent)",
-    "per_horizon_gap": "Selected minus final tree",
-    "archive_position": "DQN archive position",
+    "per_horizon_gap": "Selected minus final parameters",
+    "archive_position": "Archive position",
     "identified_seeds": "Seeds identified",
 }
 BASELINE_DISPLAY: dict[str, str] = {
     "copy": "Copy baseline",
-    "climatology_entropy": "Climatology baseline (class entropy)",
-    "climatology_mse": "Climatology baseline (mean image)",
-    "binding": "Binding baseline (lower of the two)",
+    "climatology_entropy": "Climatology floor (class frequencies)",
+    "climatology_mse": "Climatology floor (mean image)",
+    "binding": "Lower of copy and climatology",
 }
 
 # Raw artefact keys are lower-case words joined by underscores. Mathtext spans
