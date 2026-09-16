@@ -50,10 +50,14 @@ from src.eval.figure_style import (
 )
 from src.eval.plots import Band, FigureLayout, LayoutRow, LinePanel, Proxy
 
-# The view drawn, the summary fields drawn in it with the primary first, and
-# the conditions per row of panels.
+# The view drawn, the summary field each figure draws, and the conditions per
+# row of panels. The decoded distance squares differences of class codes, so its
+# size follows the class numbering and it is drawn as its own figure rather than
+# beside a metric that does not.
 INTERMEDIATE_FIGURE_MODE: str = OBS_MODE_EGOCENTRIC
 INTERMEDIATE_FIELDS: tuple[str, ...] = ("token_distance_mean", "decoded_distance_mean")
+INTERMEDIATE_PRIMARY_FIELDS: tuple[str, ...] = INTERMEDIATE_FIELDS[:1]
+INTERMEDIATE_SECONDARY_FIELDS: tuple[str, ...] = INTERMEDIATE_FIELDS[1:]
 CONDITIONS_PER_ROW: int = 4
 
 # Keys of one summary row.
@@ -222,11 +226,20 @@ def _panel(  # pylint: disable=too-many-arguments
     )
 
 
-def build_intermediate_compounding(tree: OutputsTree, split: str) -> FigureBuild:  # pylint: disable=too-many-locals
+def build_intermediate_compounding(  # pylint: disable=too-many-locals
+    tree: OutputsTree,
+    split: str,
+    fields: tuple[str, ...] = INTERMEDIATE_PRIMARY_FIELDS,
+) -> FigureBuild:
     """Per-step movement of the autoregressive arms per symbolic condition, both truth sources.
 
-    The split argument is ignored: each held-out summary is already scored on the
-    test split.
+    Args:
+        tree: The outputs tree read.
+        split: Ignored, since each held-out summary is already scored on test.
+        fields: Summary fields drawn, one block of rows each.
+
+    Returns:
+        The built figure.
     """
     del split
     reader = Reader(tree, REPORTED_SPLIT)
@@ -239,13 +252,13 @@ def build_intermediate_compounding(tree: OutputsTree, split: str) -> FigureBuild
             reader.omit(f"{condition.name}: {error}")
     if not present:
         raise MissingArtefactError("no condition holds an intermediate-state summary")
-    reader.keys.update(INTERMEDIATE_FIELDS)
+    reader.keys.update(fields)
     rows: list[LayoutRow] = []
-    for field_index, field in enumerate(INTERMEDIATE_FIELDS):
+    for field_index, field in enumerate(fields):
         for start in range(0, len(present), CONDITIONS_PER_ROW):
             chunk = present[start:start + CONDITIONS_PER_ROW]
             bottom_row = (
-                field_index == len(INTERMEDIATE_FIELDS) - 1
+                field_index == len(fields) - 1
                 and start + CONDITIONS_PER_ROW >= len(present)
             )
             panels: list[LinePanel | None] = [
@@ -266,3 +279,16 @@ def build_intermediate_compounding(tree: OutputsTree, split: str) -> FigureBuild
         ),
     )
     return reader.finish(FigureLayout("", tuple(rows), proxies=proxies))
+
+
+def build_intermediate_compounding_decoded(tree: OutputsTree, split: str) -> FigureBuild:
+    """The decoded-grid counterpart of the main-text intermediate-state figure.
+
+    Args:
+        tree: The outputs tree read.
+        split: Ignored, as above.
+
+    Returns:
+        The built figure.
+    """
+    return build_intermediate_compounding(tree, split, INTERMEDIATE_SECONDARY_FIELDS)
