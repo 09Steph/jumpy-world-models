@@ -21,12 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from config import (
-    ARM_AR_ENDPOINT,
+    ABLATION_RUNS,
     ARM_AR_ONE_STEP,
     ARM_DIRECT,
     ARMS,
     ATARI_GAMES,
-    ATARI_LONG_HORIZON,
     ATARI_LONG_HORIZON_ENV_NAME,
     ATARI_LONG_HORIZON_GAME,
     DISPLACEMENT_CSV_FILENAME,
@@ -39,18 +38,20 @@ from config import (
     OBS_MODE_TOP_DOWN,
     OBS_MODES,
     OUTPUTS_DIR,
+    PIXEL_ARMS,
     REPORTED_RATIO_HORIZONS,
+    REPORTED_RUNS,
     REPRESENTATION_GREYSCALE,
     REPRESENTATION_RGB,
     REPRESENTATION_SYMBOLIC,
     SEEDS,
     TEST_RUN_SUFFIX,
+    ReportedRun,
 )
 from src.eval.figure_style import (
     ARM_COLOURS,
     ARM_DISPLAY,
     ARM_LINE_STYLES,
-    ARM_MARKERS,
     ARM_SHORT_DISPLAY,
     BASELINE_COLOUR,
     BASELINE_DISPLAY,
@@ -84,6 +85,7 @@ from src.eval.figure_style import (
     REFERENCE_ALPHA,
     REPRESENTATION_DISPLAY,
     REPRESENTATION_LINE_STYLES,
+    REPRESENTATION_MARKERS,
     ROOM_COLOURS,
     SECONDARY_MARKER,
     SELECTION_ROW_HEIGHT_IN,
@@ -143,6 +145,9 @@ ATARI_RANKING_GLOB: str = "atari_game_ranking_position*.json"
 # The reported split, and the split a development twin reads.
 REPORTED_SPLIT: str = "test"
 VALIDATION_SPLIT: str = "validation"
+
+# The key a re-scored test aggregate carries at every horizon.
+REPORTABLE_MARKER_KEY: str = CLIMATOLOGY_MSE_KEY
 
 # Artefact keys read here that no shared schema module names.
 AGGREGATE_FILENAME_TEMPLATE: str = "aggregate_arm{arm}.json"
@@ -230,14 +235,43 @@ class FigureContractError(ValueError):
 
 @dataclass(frozen=True)
 class Condition:
-    """One reported condition and the run each arm is read from."""
+    """One reported condition, as the figures name and score it.
 
-    room: str
-    policy: str
-    slip: str
-    env: str
-    representation: str
-    arm_runs: tuple[tuple[int, str], ...]
+    A view over the declaration in config, forwarding its facts and adding the
+    labels and views a figure reads.
+    """
+
+    run: ReportedRun
+
+    @property
+    def room(self) -> str:
+        """The room the trajectories were collected in."""
+        return self.run.room
+
+    @property
+    def policy(self) -> str:
+        """The policy that collected them."""
+        return self.run.policy
+
+    @property
+    def slip(self) -> str:
+        """The stochasticity setting."""
+        return self.run.slip
+
+    @property
+    def env(self) -> str:
+        """The environment the runs were scored in."""
+        return self.run.env
+
+    @property
+    def representation(self) -> str:
+        """The observation representation."""
+        return self.run.representation
+
+    @property
+    def arm_runs(self) -> tuple[tuple[int, str], ...]:
+        """Each arm and the run it is read from."""
+        return self.run.arm_runs
 
     @property
     def room_policy(self) -> str:
@@ -255,9 +289,14 @@ class Condition:
         return f"{self.room}\n{self.policy}, {self.slip}"
 
     @property
+    def full_name(self) -> str:
+        """The condition on one line, led by its representation."""
+        return f"{REPRESENTATION_DISPLAY[self.representation]} {self.name}"
+
+    @property
     def arms(self) -> tuple[int, ...]:
         """The arms the condition carries."""
-        return tuple(arm for arm, _ in self.arm_runs)
+        return self.run.arms
 
     @property
     def modes(self) -> tuple[str, ...]:
@@ -270,80 +309,30 @@ class Condition:
 
     def run_for(self, arm: int) -> str:
         """The run an arm is read from, without the split suffix."""
-        return dict(self.arm_runs)[arm]
+        return self.run.run_for(arm)
 
 
-def _every_arm(run: str, arms: Sequence[int] = ARMS) -> tuple[tuple[int, str], ...]:
-    """Map every arm to one run."""
-    return tuple((arm, run) for arm in arms)
+def _view(name: str) -> Condition:
+    """Return the figures' view of one declared condition."""
+    return Condition(REPORTED_RUNS[name])
 
 
 # The reported conditions, in the order the figures draw them.
-FOURROOMS_ENV: str = "Navix-FourRooms-v0"
-DOORKEY_ENV: str = "Navix-DoorKey-Random-5x5-v0"
-DYNAMIC_OBSTACLES_ENV: str = "Navix-Dynamic-Obstacles-16x16-v0"
-NO_SLIP: str = "slip 0.00"
-PIXEL_ARMS: tuple[int, ...] = (ARM_DIRECT, ARM_AR_ONE_STEP)
-
-FOURROOMS_NO_SLIP = Condition(
-    "FourRooms", "uniform", NO_SLIP, FOURROOMS_ENV, REPRESENTATION_SYMBOLIC,
-    ((ARM_DIRECT, "e1_50k"), (ARM_AR_ENDPOINT, "e2_base"), (ARM_AR_ONE_STEP, "e2_base")),
-)
-FOURROOMS_SLIP_010 = Condition(
-    "FourRooms", "uniform", "slip 0.10", FOURROOMS_ENV, REPRESENTATION_SYMBOLIC,
-    _every_arm("e3_p010"),
-)
-FOURROOMS_SLIP_025 = Condition(
-    "FourRooms", "uniform", "slip 0.25", FOURROOMS_ENV, REPRESENTATION_SYMBOLIC,
-    _every_arm("e3_p025"),
-)
-DYNAMIC_OBSTACLES_UNIFORM = Condition(
-    "Dynamic-Obstacles", "uniform", NO_SLIP, DYNAMIC_OBSTACLES_ENV, REPRESENTATION_SYMBOLIC,
-    _every_arm("e3_dynobs"),
-)
-DOORKEY_UNIFORM = Condition(
-    "DoorKey", "uniform", NO_SLIP, DOORKEY_ENV, REPRESENTATION_SYMBOLIC,
-    _every_arm("e6_doorkey_uniform"),
-)
-FOURROOMS_PPO = Condition(
-    "FourRooms", "PPO", NO_SLIP, FOURROOMS_ENV, REPRESENTATION_SYMBOLIC, _every_arm("e5_fr_ppo"),
-)
-DOORKEY_PPO = Condition(
-    "DoorKey", "PPO", NO_SLIP, DOORKEY_ENV, REPRESENTATION_SYMBOLIC, _every_arm("e10b_dk_ppo_3arm"),
-)
-DYNAMIC_OBSTACLES_PPO = Condition(
-    "Dynamic-Obstacles", "PPO", NO_SLIP, DYNAMIC_OBSTACLES_ENV, REPRESENTATION_SYMBOLIC,
-    _every_arm("e11b_dynobs_ppo_3arm"),
-)
-PIXEL_FOURROOMS = Condition(
-    "FourRooms", "PPO", NO_SLIP, FOURROOMS_ENV, REPRESENTATION_RGB,
-    _every_arm("e7_fr_rgb_ppo", PIXEL_ARMS),
-)
-PIXEL_DOORKEY = Condition(
-    "DoorKey", "PPO", NO_SLIP, DOORKEY_ENV, REPRESENTATION_RGB,
-    _every_arm("e8_dk_rgb_ppo", PIXEL_ARMS),
-)
-PIXEL_DYNAMIC_OBSTACLES = Condition(
-    "Dynamic-Obstacles", "PPO", NO_SLIP, DYNAMIC_OBSTACLES_ENV, REPRESENTATION_RGB,
-    _every_arm("e9_dynobs_rgb_ppo", PIXEL_ARMS),
-)
-ATARI_POSITION_0 = Condition(
-    "Atari", "DQN Replay", "position 0", "atari-dqn-replay", REPRESENTATION_GREYSCALE,
-    _every_arm("a_base_p0", PIXEL_ARMS),
-)
-ATARI_POSITION_24 = Condition(
-    "Atari", "DQN Replay", "position 24", "atari-dqn-replay-p24", REPRESENTATION_GREYSCALE,
-    _every_arm("a_ladder_p24", PIXEL_ARMS),
-)
-ATARI_POSITION_49 = Condition(
-    "Atari", "DQN Replay", "position 49", "atari-dqn-replay-p49", REPRESENTATION_GREYSCALE,
-    _every_arm("a_ladder_p49", PIXEL_ARMS),
-)
-LONG_HORIZON = Condition(
-    ATARI_LONG_HORIZON_GAME, "DQN Replay", f"trained to h = {ATARI_LONG_HORIZON}",
-    ATARI_LONG_HORIZON_ENV_NAME, REPRESENTATION_GREYSCALE,
-    _every_arm("b44_robotank_h1024", PIXEL_ARMS),
-)
+FOURROOMS_NO_SLIP = _view("FOURROOMS_NO_SLIP")
+FOURROOMS_SLIP_010 = _view("FOURROOMS_SLIP_010")
+FOURROOMS_SLIP_025 = _view("FOURROOMS_SLIP_025")
+DYNAMIC_OBSTACLES_UNIFORM = _view("DYNAMIC_OBSTACLES_UNIFORM")
+DOORKEY_UNIFORM = _view("DOORKEY_UNIFORM")
+FOURROOMS_PPO = _view("FOURROOMS_PPO")
+DOORKEY_PPO = _view("DOORKEY_PPO")
+DYNAMIC_OBSTACLES_PPO = _view("DYNAMIC_OBSTACLES_PPO")
+PIXEL_FOURROOMS = _view("PIXEL_FOURROOMS")
+PIXEL_DOORKEY = _view("PIXEL_DOORKEY")
+PIXEL_DYNAMIC_OBSTACLES = _view("PIXEL_DYNAMIC_OBSTACLES")
+ATARI_POSITION_0 = _view("ATARI_POSITION_0")
+ATARI_POSITION_24 = _view("ATARI_POSITION_24")
+ATARI_POSITION_49 = _view("ATARI_POSITION_49")
+LONG_HORIZON = _view("LONG_HORIZON")
 
 SYMBOLIC_CONDITIONS: tuple[Condition, ...] = (
     FOURROOMS_NO_SLIP, FOURROOMS_SLIP_010, FOURROOMS_SLIP_025, DYNAMIC_OBSTACLES_UNIFORM,
@@ -369,17 +358,11 @@ REPRESENTATION_PAIRS: tuple[tuple[Condition, Condition], ...] = (
 ATARI_LADDER: tuple[tuple[int, Condition], ...] = (
     (0, ATARI_POSITION_0), (24, ATARI_POSITION_24), (49, ATARI_POSITION_49),
 )
-HORIZON_ABLATION: tuple[tuple[int, str], ...] = (
-    (128, "b44_ablation_h128"),
-    (256, "b44_ablation_h256"),
-    (512, "b44_ablation_h512"),
-    (ATARI_LONG_HORIZON, "b44_robotank_h1024"),
-)
-
 # The saturation figure: the conditions it draws, the arm its data row reads,
-# the arms its model row draws, each row's title and metric, and the columns of
-# the table of plotted values it writes.
-SATURATION_CONDITIONS: tuple[Condition, ...] = ROOM_POLICY_CONDITIONS
+# the arms its model row draws, each row's title and metric, the columns of the
+# table of plotted values it writes, its caption note, and the omission naming
+# the conditions a view does not score.
+SATURATION_CONDITIONS: tuple[Condition, ...] = ROOM_POLICY_CONDITIONS + PIXEL_CONDITIONS
 SATURATION_DATA_ARM: int = ARM_DIRECT
 SATURATION_MODEL_ARMS: tuple[int, ...] = (ARM_DIRECT,)
 MEAN_CHANGED_CELLS_KEY: str = "mean_changed_cells"
@@ -388,17 +371,20 @@ SATURATION_ROWS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
     ("Model", MOVER_ACCURACY_KEY, SATURATION_MODEL_ARMS),
 )
 SATURATION_TABLE_COLUMNS: tuple[str, ...] = (
-    "row", "view", "room", "policy", "arm", "source", "metric", "horizon",
-    "iqm", "ci_low", "ci_high",
+    "row", "view", "room", "policy", "representation", "arm", "source", "metric",
+    "horizon", "iqm", "ci_low", "ci_high",
 )
 STATE_CHANGE_NOTE: str = (
-    "state change counts the cells changed on each room's own grid, so its level "
-    "is not comparable between rooms"
+    "state change counts the cells changed on each condition's own grid, and the grids "
+    "differ between rooms and between symbolic and pixel observations, so only the "
+    "flattening of each line is compared, never its level"
 )
-PIXEL_SATURATION_ABSENT: str = (
-    "pixel rows are not drawn: displacement.csv carries neither model_mse nor copy_mse, "
-    "and a Hamming cell fraction cannot share the changed-cell axis"
+UNSCORED_VIEW_OMISSION: str = (
+    "{conditions}: not scored in the {view}, so its panels omit them"
 )
+
+# Title of the mode-gap figure's gap panel.
+MODE_GAP_TITLE: str = f"{ARM_SHORT_DISPLAY[ARM_DIRECT]}, top-down minus egocentric"
 
 # Free text of the slip figure's gap panels.
 GAP_READOUTS: tuple[tuple[str, str], ...] = (
@@ -406,7 +392,7 @@ GAP_READOUTS: tuple[tuple[str, str], ...] = (
     (ENDPOINT_RATIO_KEY, "Gap in endpoint error ratio"),
     (SIGMA_INTEGRAL_KEY, "Gap in compounding error"),
 )
-GAP_AXIS_LABEL: str = "Arm 3 minus arm 1"
+GAP_AXIS_LABEL: str = f"{ARM_SHORT_DISPLAY[ARM_AR_ONE_STEP]} minus {ARM_SHORT_DISPLAY[ARM_DIRECT]}"
 SLIP_LADDER_LEGEND: str = "FourRooms, uniform, slip ladder"
 DYNAMIC_OBSTACLES_TICK: str = "Dynamic-\nObstacles"
 
@@ -539,6 +525,12 @@ def stat_of(block: Any) -> Stat | None:
 def horizon_stat(mode_block: dict, horizon: int, key: str) -> Stat | None:
     """Return one metric's statistic at one horizon of a mode block."""
     return stat_of(((mode_block.get(PER_HORIZON_KEY) or {}).get(str(horizon)) or {}).get(key))
+
+
+def is_reportable(block: dict) -> bool:
+    """Return whether a mode block carries the reportability marker at every horizon."""
+    per = block.get(PER_HORIZON_KEY) or {}
+    return bool(per) and all(REPORTABLE_MARKER_KEY in (entry or {}) for entry in per.values())
 
 
 def sigma_stat(arm_block: dict, reading: str) -> Stat | None:
@@ -717,6 +709,16 @@ class Reader:
         """Load one arm's aggregate for a condition."""
         return self.tree.aggregate(condition.run_for(arm), condition.env, arm, self.split)
 
+    def _absence(
+        self, condition: Condition, arm: int, error: MissingArtefactError, mode: str = ""
+    ) -> str:
+        """Return the omission for an absent artefact, naming an absent declared run as such."""
+        run = condition.run_for(arm)
+        if not self.tree.run_dir(run, self.split).is_dir():
+            return f"{condition.name}: declared run {run} is not in this tree"
+        where = f", {mode}" if mode else ""
+        return f"{condition.name}, arm {arm}{where}: {error}"
+
     def aggregates(self, condition: Condition) -> dict[int, Artefact]:
         """Load every arm's aggregate a condition has, recording the absent ones."""
         found: dict[int, Artefact] = {}
@@ -724,18 +726,32 @@ class Reader:
             try:
                 found[arm] = self.aggregate_for(condition, arm)
             except MissingArtefactError as error:
-                self.omit(f"{condition.name}, arm {arm}: {error}")
+                self.omit(self._absence(condition, arm, error))
         if not found:
             raise MissingArtefactError(f"{condition.name}: no arm has an aggregate")
         return found
 
+    def _reportable(self, artefact: Artefact, block: dict, mode: str) -> bool:
+        """Return whether a mode block may be drawn, recording why where it may not.
+
+        Only the reported split is gated; a validation block always passes.
+        """
+        if self.split != REPORTED_SPLIT or is_reportable(block):
+            return True
+        self.omit(f"{artefact.cited} {mode}: not reportable, no post-B46 marker")
+        return False
+
     def arm_fit(self, condition: Condition, arm: int, mode: str) -> tuple[Artefact, dict] | None:
-        """Load one arm's fit block, recording an absence or a seed shortfall."""
+        """Load one arm's fit block, recording an absence, an unreportable run or a shortfall."""
         try:
             artefact = self.tree.fit(condition.run_for(arm), condition.env, self.split)
             block = artefact.arm(mode, arm)
+            if self.split == REPORTED_SPLIT:
+                aggregate = self.aggregate_for(condition, arm)
+                if not self._reportable(aggregate, aggregate.mode(mode), mode):
+                    return None
         except MissingArtefactError as error:
-            self.omit(f"{condition.name}, arm {arm}, {mode}: {error}")
+            self.omit(self._absence(condition, arm, error, mode))
             return None
         count = len(block.get(SEEDS_KEY) or ())
         if count < len(SEEDS):
@@ -743,15 +759,18 @@ class Reader:
         return artefact, block
 
     def mode_block(self, artefact: Artefact, mode: str) -> dict | None:
-        """Return an aggregate's mode block, recording an absence or a seed shortfall."""
+        """Return an aggregate's mode block, withholding one unreportable or short of seeds."""
         try:
             block = artefact.mode(mode)
         except MissingArtefactError as error:
             self.omit(str(error))
             return None
+        if not self._reportable(artefact, block, mode):
+            return None
         count = block.get(N_SEEDS_KEY)
         if count is not None and count < len(SEEDS):
             self.omit(f"{artefact.cited} {mode}: {count} of {len(SEEDS)} seeds")
+            return None
         return block
 
     def finish(self, layout: FigureLayout, table: Sequence[dict] = ()) -> FigureBuild:
@@ -1227,7 +1246,7 @@ def build_pixel_mover_skill(tree: OutputsTree, split: str) -> FigureBuild:
         raise MissingArtefactError(f"no pixel run carries {MOVER_MSE_SKILL_KEY}")
     proxies = (
         *extrapolation_proxies(panels),
-        Proxy("Whole-frame copy-normalised skill, faint", NEUTRAL_COLOUR),
+        Proxy("Whole-frame skill score", NEUTRAL_COLOUR),
     )
     return reader.finish(FigureLayout(
         "", (LayoutRow(tuple(panels)),), proxies=proxies, legend_columns=3,
@@ -1376,7 +1395,7 @@ def build_mode_gap(tree: OutputsTree, split: str) -> FigureBuild:
         raise MissingArtefactError(f"{FOURROOMS_NO_SLIP.name}: no arm carries {SKILL_SCORE_KEY}")
     gap = None if ARM_DIRECT not in aggregates else _mode_gap_band(reader, aggregates[ARM_DIRECT])
     gap_panel = None if gap is None else LinePanel(
-        "Arm 1, top-down minus egocentric", (gap,), "Difference in skill score", zero_line=True,
+        MODE_GAP_TITLE, (gap,), "Difference in skill score", zero_line=True,
     )
     panels = (
         LinePanel("Both views", tuple(bands), METRIC_DISPLAY[SKILL_SCORE_KEY], zero_line=True),
@@ -1620,14 +1639,14 @@ def _saturation_band(  # pylint: disable=too-many-arguments,too-many-locals
     model_row = name == SATURATION_ROWS[-1][0]
     for horizon, centre, low, high in zip(curve.horizons, curve.centre, curve.low, curve.high):
         values = (
-            name, mode, condition.room, condition.policy, arm if model_row else "",
-            artefact.cited, key, horizon, centre, low, high,
+            name, mode, condition.room, condition.policy, condition.representation,
+            arm if model_row else "", artefact.cited, key, horizon, centre, low, high,
         )
         table.append(dict(zip(SATURATION_TABLE_COLUMNS, values)))
     return Band(
         None, tuple(map(float, curve.horizons)), curve.centre, ROOM_COLOURS[condition.room],
         curve.low, curve.high, line_style=POLICY_LINE_STYLES[condition.policy],
-        marker=ARM_MARKERS[arm] if model_row else None,
+        marker=REPRESENTATION_MARKERS[condition.representation],
     )
 
 
@@ -1642,7 +1661,8 @@ def build_data_saturation(tree: OutputsTree, split: str) -> FigureBuild:  # pyli
         for mode in OBS_MODES:
             bands = [
                 band
-                for condition in SATURATION_CONDITIONS for arm in arms
+                for condition in SATURATION_CONDITIONS if mode in condition.modes
+                for arm in arms
                 if (band := _saturation_band(reader, table, condition, arm, mode=mode, row=row))
                 is not None
             ]
@@ -1654,15 +1674,24 @@ def build_data_saturation(tree: OutputsTree, split: str) -> FigureBuild:  # pyli
     if not table:
         raise MissingArtefactError("no room or policy condition carries the saturation metrics")
     reader.notes.append(STATE_CHANGE_NOTE)
-    reader.omit(PIXEL_SATURATION_ABSENT)
+    for mode in OBS_MODES:
+        unscored = [condition for condition in SATURATION_CONDITIONS if mode not in condition.modes]
+        if unscored:
+            reader.omit(UNSCORED_VIEW_OMISSION.format(
+                conditions="; ".join(condition.full_name for condition in unscored),
+                view=MODE_DISPLAY[mode].lower(),
+            ))
     rooms = dict.fromkeys(condition.room for condition in SATURATION_CONDITIONS)
     policies = dict.fromkeys(condition.policy for condition in SATURATION_CONDITIONS)
+    representations = dict.fromkeys(entry["representation"] for entry in table)
     proxies = (
         *(Proxy(room, ROOM_COLOURS[room]) for room in rooms),
         *(Proxy(POLICY_DISPLAY[policy], NEUTRAL_COLOUR, POLICY_LINE_STYLES[policy])
           for policy in policies),
-        *(Proxy(ARM_DISPLAY[arm], NEUTRAL_COLOUR, "none", ARM_MARKERS[arm])
-          for arm in SATURATION_MODEL_ARMS),
+        *(Proxy(REPRESENTATION_DISPLAY[representation], NEUTRAL_COLOUR, "none",
+                REPRESENTATION_MARKERS[representation])
+          for representation in representations),
+        *(Proxy(ARM_DISPLAY[arm], NEUTRAL_COLOUR, "none") for arm in SATURATION_MODEL_ARMS),
     )
     layout = FigureLayout("", tuple(rows), proxies=proxies, legend_columns=4)
     return reader.finish(layout, table)
@@ -1785,7 +1814,7 @@ def build_horizon_ablation(tree: OutputsTree, split: str) -> FigureBuild:  # pyl
     bands: list[Band] = []
     lines: list[tuple[float, str]] = []
     y_label = ""
-    for index, (trained, run) in enumerate(HORIZON_ABLATION):
+    for index, (trained, run) in enumerate(ABLATION_RUNS):
         colour = LADDER_COLOURS[index % len(LADDER_COLOURS)]
         try:
             artefact = tree.aggregate(run, ATARI_LONG_HORIZON_ENV_NAME, ARM_DIRECT, split)
