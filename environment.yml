@@ -1,6 +1,6 @@
 # Conda environment for jumpy-world-models.
 #
-# flax is installed separately; its metadata demands jax>=0.10.0.
+# flax is installed by setup_env.sh, pinned to the version the results used.
 name: jumpy
 channels:
   - conda-forge
@@ -8,9 +8,8 @@ dependencies:
   - python=3.11
   - numpy=2.4.6
   - pytest
-  # Trajectory storage, HDF5 on Minari's per-episode schema. From conda-forge,
-  # not pip: h5py links against numpy's C API and the numpy pin is a conda
-  # package.
+  # Trajectory storage: HDF5 on a Minari-like per-episode schema. From
+  # conda-forge, to build against the conda numpy.
   - h5py=3.16.0
   - matplotlib=3.11.1
   - pip
@@ -36,6 +35,8 @@ dependencies:
       - nvidia-nvtx-cu12==12.4.127; sys_platform == "linux"
       - distrax==0.1.9
       - navix==0.7.4
+      # navix imports wandb when it is imported. Nothing in this project calls it.
+      - wandb==0.28.0
       - orbax-checkpoint==0.12.0
       - optax==0.2.8
       # pandas must stay below 3. rliable's bootstrap engine (arch) calls a
@@ -44,6 +45,15 @@ dependencies:
       - arch==7.2.0
       - pandas==2.3.3
       - scipy==1.17.1
-      - gymnasium==1.3.0
+      # gymnasium is pinned by nle, which demands exactly 1.0.0. minigrid
+      # accepts >=0.28.1, so the pin satisfies every dependent.
+      - gymnasium==1.0.0
       - minigrid==3.1.0
+      # NetHack Learning Environment. It compiles from C source on macOS arm64,
+      # where no wheel exists, and installs a wheel on Linux, so the platforms
+      # do not resolve identically.
+      - nle==1.2.0
       - tfp-nightly==0.26.0.dev20260725
+      # Arcade Learning Environment. gymnasium>=1.1.0 appears only under its
+      # optional extras, so the 1.0.0 pin nle demands above is untouched.
+      - ale-py==0.12.1
