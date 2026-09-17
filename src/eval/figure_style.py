@@ -166,6 +166,7 @@ METRIC_DISPLAY: dict[str, str] = {
     "mover_restricted_skill_score": "Mover-restricted skill score",
     "mover_restricted_accuracy": "Mover-restricted accuracy",
     "mean_changed_cells": "Cells changed from\nthe start (count)",
+    "mean_changed_pixels": "Pixels changed from\nthe start (count)",
     "reported_exponent": "Fitted exponent",
     "endpoint_error_ratio": "Endpoint error ratio",
     "compounding_error_integral": "Compounding error\n(integral over horizons)",
