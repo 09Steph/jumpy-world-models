@@ -168,6 +168,7 @@ RESIDUALS_KEY: str = "residuals"
 ENDPOINT_RATIO_KEY: str = "endpoint_error_ratio"
 ESTIMATOR_KEYS: tuple[str, ...] = ("three_parameter", "two_parameter", "log_log")
 MOVER_ACCURACY_KEY: str = "mover_restricted_accuracy"
+MOVER_SKILL_KEY: str = "mover_restricted_skill_score"
 DISPLACEMENT_ENVIRONMENT_COLUMN: str = "environment"
 DISPLACEMENT_MODE_COLUMN: str = "mode"
 DISPLACEMENT_MEASURE_COLUMN: str = "measure"
@@ -366,9 +367,20 @@ SATURATION_CONDITIONS: tuple[Condition, ...] = ROOM_POLICY_CONDITIONS + PIXEL_CO
 SATURATION_DATA_ARM: int = ARM_DIRECT
 SATURATION_MODEL_ARMS: tuple[int, ...] = (ARM_DIRECT,)
 MEAN_CHANGED_CELLS_KEY: str = "mean_changed_cells"
-SATURATION_ROWS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
-    ("Data", MEAN_CHANGED_CELLS_KEY, (SATURATION_DATA_ARM,)),
-    ("Model", MOVER_ACCURACY_KEY, SATURATION_MODEL_ARMS),
+MEAN_CHANGED_PIXELS_KEY: str = "mean_changed_pixels"
+# Each row names the metric PER REPRESENTATION. The categorical pair is null on
+# a continuous representation by construction, so a pixel condition is read on
+# its own counterpart and drawn on its own axis: a cell count and a pixel count
+# are not the same quantity.
+SATURATION_ROWS: tuple[tuple[str, dict[str, str], tuple[int, ...]], ...] = (
+    ("Data",
+     {REPRESENTATION_SYMBOLIC: MEAN_CHANGED_CELLS_KEY,
+      REPRESENTATION_RGB: MEAN_CHANGED_PIXELS_KEY},
+     (SATURATION_DATA_ARM,)),
+    ("Model",
+     {REPRESENTATION_SYMBOLIC: MOVER_ACCURACY_KEY,
+      REPRESENTATION_RGB: MOVER_SKILL_KEY},
+     SATURATION_MODEL_ARMS),
 )
 SATURATION_TABLE_COLUMNS: tuple[str, ...] = (
     "row", "view", "room", "policy", "representation", "arm", "source", "metric",
@@ -958,17 +970,32 @@ def build_compounding_error(tree: OutputsTree, split: str) -> FigureBuild:
     return reader.finish(FigureLayout("", tuple(rows), legend_columns=len(ARMS) + 1))
 
 
-def build_compounding_alt(tree: OutputsTree, split: str) -> FigureBuild:
-    """The plain sum and the discounted integral, laid out as the reported reading is."""
+def _build_compounding_reading(tree: OutputsTree, split: str, reading: str) -> FigureBuild:
+    """One alternate reading of the compounding error, laid out as the reported one is.
+
+    Args:
+        tree: The outputs tree read.
+        split: The split scored.
+        reading: Which compounding-error key to draw.
+
+    Returns:
+        The built figure.
+    """
     reader = Reader(tree, split)
-    rows = [
-        row
-        for reading in (SIGMA_SUM_KEY, SIGMA_DISCOUNTED_INTEGRAL_KEY)
-        for row in _compounding_rows(reader, reading, READING_DISPLAY[reading])
-    ]
+    rows = _compounding_rows(reader, reading, READING_DISPLAY[reading])
     if not rows:
         raise MissingArtefactError("no condition has a fit artefact")
     return reader.finish(FigureLayout("", tuple(rows), legend_columns=len(ARMS) + 1))
+
+
+def build_compounding_sum(tree: OutputsTree, split: str) -> FigureBuild:
+    """The plain sum reading of the compounding error, by condition."""
+    return _build_compounding_reading(tree, split, SIGMA_SUM_KEY)
+
+
+def build_compounding_discounted(tree: OutputsTree, split: str) -> FigureBuild:
+    """The discounted integral reading of the compounding error, by condition."""
+    return _build_compounding_reading(tree, split, SIGMA_DISCOUNTED_INTEGRAL_KEY)
 
 
 @dataclass(frozen=True)
@@ -1175,19 +1202,31 @@ def _gap_panel(reader: Reader, readout: str, title: str) -> LinePanel | None:
 
 
 def build_slip_ladder(tree: OutputsTree, split: str) -> FigureBuild:
-    """Error under increasing slip, and the paired arm gap on each readout."""
+    """Error under increasing slip, the ladder alone."""
     reader = Reader(tree, split)
     ladder, proxies = _ladder_panel(reader)
-    gaps = tuple(_gap_panel(reader, readout, title) for readout, title in GAP_READOUTS)
-    rows = []
-    if ladder is not None:
-        rows.append(LayoutRow((ladder,)))
-    if any(panel is not None for panel in gaps):
-        rows.append(LayoutRow(gaps))
-    if not rows:
+    if ladder is None:
         raise MissingArtefactError("no rung of the slip ladder has an artefact")
     reader.notes.append(f"view: {MODE_DISPLAY[SLIP_FIGURE_MODE].lower()}")
-    return reader.finish(FigureLayout("", tuple(rows), proxies=proxies, legend_columns=3))
+    return reader.finish(FigureLayout(
+        "", (LayoutRow((ladder,)),), proxies=proxies, legend_columns=3,
+    ))
+
+
+def build_slip_gaps(tree: OutputsTree, split: str) -> FigureBuild:
+    """The paired arm gap on each readout, under increasing slip.
+
+    Drawn apart from the ladder because the two answer different questions and
+    together they run to 4.7 in of a 9 in text block.
+    """
+    reader = Reader(tree, split)
+    gaps = tuple(_gap_panel(reader, readout, title) for readout, title in GAP_READOUTS)
+    if not any(panel is not None for panel in gaps):
+        raise MissingArtefactError("no readout has a paired arm gap")
+    reader.notes.append(f"view: {MODE_DISPLAY[SLIP_FIGURE_MODE].lower()}")
+    return reader.finish(FigureLayout(
+        "", (LayoutRow(gaps),), proxies=arm_proxies(ARMS), legend_columns=len(ARMS),
+    ))
 
 
 def build_pixel_error(tree: OutputsTree, split: str) -> FigureBuild:
@@ -1619,10 +1658,15 @@ def _saturation_band(  # pylint: disable=too-many-arguments,too-many-locals
     arm: int,
     *,
     mode: str,
-    row: tuple[str, str, tuple[int, ...]],
+    row: tuple[str, dict[str, str], tuple[int, ...]],
 ) -> Band | None:
     """Return one condition's curve of one saturation metric, recording each plotted value."""
-    name, key, _ = row
+    name, keys, _ = row
+    key = keys.get(condition.representation)
+    if key is None:
+        reader.omit(f"{condition.name}: {name.lower()} has no metric on "
+                    f"{REPRESENTATION_DISPLAY[condition.representation].lower()}")
+        return None
     try:
         artefact = reader.aggregate_for(condition, arm)
     except MissingArtefactError as error:
@@ -1656,20 +1700,27 @@ def build_data_saturation(tree: OutputsTree, split: str) -> FigureBuild:  # pyli
     table: list[dict] = []
     rows: list[LayoutRow] = []
     for row in SATURATION_ROWS:
-        name, key, arms = row
+        name, keys, arms = row
         panels: list[LinePanel | None] = []
         for mode in OBS_MODES:
-            bands = [
-                band
-                for condition in SATURATION_CONDITIONS if mode in condition.modes
-                for arm in arms
-                if (band := _saturation_band(reader, table, condition, arm, mode=mode, row=row))
-                is not None
-            ]
-            panels.append(LinePanel(
-                f"{name}, {MODE_DISPLAY[mode].lower()}", tuple(bands), METRIC_DISPLAY[key]
-            ) if bands else None)
-        if any(panel is not None for panel in panels):
+            for representation, key in keys.items():
+                bands = [
+                    band
+                    for condition in SATURATION_CONDITIONS
+                    if mode in condition.modes
+                    and condition.representation == representation
+                    for arm in arms
+                    if (band := _saturation_band(
+                        reader, table, condition, arm, mode=mode, row=row)) is not None
+                ]
+                if not bands:
+                    continue
+                panels.append(LinePanel(
+                    f"{name}, {REPRESENTATION_DISPLAY[representation].lower()}, "
+                    f"{MODE_DISPLAY[mode].lower()}",
+                    tuple(bands), METRIC_DISPLAY[key],
+                ))
+        if panels:
             rows.append(LayoutRow(tuple(panels), COMPACT_ROW_HEIGHT_IN))
     if not table:
         raise MissingArtefactError("no room or policy condition carries the saturation metrics")
@@ -1792,19 +1843,25 @@ def build_best_vs_final(tree: OutputsTree, split: str) -> FigureBuild:
 
 
 def build_atari_error(tree: OutputsTree, split: str) -> FigureBuild:
-    """Atari error against horizon at archive position 0, the games pooled."""
+    """Atari error against horizon, one panel per archive position, games pooled."""
     reader = Reader(tree, split)
-    position, condition = ATARI_LADDER[0]
-    aggregates = reader.aggregates(condition)
-    panel = error_panel(
-        reader, aggregates, ATARI_MODE,
-        f"{len(ATARI_GAMES)} games pooled, archive position {position}", binding=True,
-    )
-    if panel is None:
-        raise MissingArtefactError(f"{condition.name}: no arm has an error curve")
+    panels: list[LinePanel] = []
+    for position, condition in ATARI_LADDER:
+        aggregates = reader.aggregates(condition)
+        panel = error_panel(
+            reader, aggregates, ATARI_MODE,
+            f"Archive position {position}", binding=True,
+        )
+        if panel is None:
+            reader.omit(f"{condition.name}: no arm has an error curve")
+            continue
+        panels.append(panel)
+    if not panels:
+        raise MissingArtefactError("no archive position has an error curve")
     reader.omit(f"per-game panels are not drawn: {PER_GAME_ABSENT}")
     return reader.finish(FigureLayout(
-        "", (LayoutRow((panel,)),), proxies=extrapolation_proxies((panel,)), legend_columns=1,
+        "", (LayoutRow(tuple(panels)),),
+        proxies=extrapolation_proxies(tuple(panels)), legend_columns=len(ARMS) + 1,
     ))
 
 
