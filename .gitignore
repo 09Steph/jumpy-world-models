@@ -15,13 +15,18 @@ htmlcov/
 outputs/*
 !outputs/.gitkeep
 
-# Throwaway diagnostic scripts
+# Offline datasets. Directory kept, not the contents.
+datasets/*
+!datasets/.gitkeep
+
+# Result artefacts, kept off the repository. Directory kept, not the contents.
+results/*
+!results/.gitkeep
+
+# Local diagnostic scripts, not shipped
 temp_files/
 
-# Test suite. Untracked by decision, 2026-08-17.
-# NOTE: the reproducibility appendix and the submitted code repo are graded, and
-# `git add tests/...` on an ignored path succeeds silently while adding nothing.
-# Revisit before the 11-12 September code-vs-report audit.
+# Test suite
 /tests
 
 # Editors
@@ -40,3 +45,6 @@ Thumbs.db
 .venv/
 venv/
 env/
+
+# Operational scripts, kept local
+/scripts
