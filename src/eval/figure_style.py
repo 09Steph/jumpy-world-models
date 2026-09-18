@@ -22,7 +22,7 @@ PRINT_WIDTHS_IN: tuple[float, ...] = (THESIS_TEXT_WIDTH_IN, THESIS_HALF_WIDTH_IN
 
 # Heights in inches, and the forest series count per row. A figure's height is
 # its row heights plus FURNITURE_HEIGHT_IN.
-PANEL_ROW_HEIGHT_IN: float = 1.9
+PANEL_ROW_HEIGHT_IN: float = 1.5
 COMPACT_ROW_HEIGHT_IN: float = 1.45
 FOREST_ROW_HEIGHT_IN: float = 0.2
 FOREST_AXIS_HEIGHT_IN: float = 0.6
